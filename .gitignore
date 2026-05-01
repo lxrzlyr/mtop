@@ -1,0 +1,13 @@
+build/
+dist/
+_CPack_Packages/
+.cache/
+.git.old-history/
+.DS_Store
+**/.DS_Store
+*.swp
+*.swo
+*.tmp
+compile_commands.json
+*.tar.gz
+微信图片_*.png

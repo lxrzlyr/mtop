@@ -1,0 +1,5 @@
+# mtop config example
+theme=apple
+refresh_ms=1000
+process_limit=12
+demo_mode=false
