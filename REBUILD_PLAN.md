@@ -8,7 +8,7 @@ Build `mtop`, a new macOS-first terminal system monitor for Apple Silicon, that:
 - provides a stable `htop`-style CPU/process experience
 - provides a stable `nvtop`-style GPU overview
 - uses root only for optional extended hardware telemetry
-- replaces the old Python-first `asitop` structure with a cleaner architecture
+- uses a cleaner architecture centered on the current C++ / Objective-C++ implementation
 
 ## Status
 
@@ -37,7 +37,7 @@ The remaining work is iterative refinement rather than foundational migration.
    one row per core, compact text meter style.
 3. GPU visualization should follow `nvtop` conventions:
    total GPU charts first, process GPU only where supported.
-4. The project should not remain a patched `asitop`; old structures should be retired.
+4. The project should keep a clean architecture without legacy layout constraints.
 
 ## Source Strategy
 
@@ -260,7 +260,7 @@ Deliverables:
 
 Acceptance:
 
-- root directory no longer depends on old `asitop` package layout
+- root directory no longer depends on a legacy package layout
 
 ## Phase 1: Core model and build skeleton
 
@@ -388,7 +388,7 @@ Scope:
 
 - release build flow
 - install instructions
-- migration notes from old `asitop`
+- project evolution notes
 
 Deliverables:
 

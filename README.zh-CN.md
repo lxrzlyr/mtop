@@ -6,6 +6,37 @@
 
 它希望让熟悉 `htop` 和 `nvtop` 的用户上手时没有门槛，但它的设计重点放在 macOS 和 M 系列 SoC 的真实特点上：统一内存、异构核心、GPU 活动、以及对本地 AI 工作负载有意义的功耗信息。
 
+## 快速开始
+
+直接通过 Homebrew tap 安装：
+
+```bash
+brew install lxrzlyr/mtop/mtop
+```
+
+或者先 tap 一次，再使用短名字：
+
+```bash
+brew tap lxrzlyr/mtop
+brew install mtop
+```
+
+运行：
+
+```bash
+mtop
+```
+
+预览模式：
+
+```bash
+mtop --demo
+```
+
+## 截图
+
+![mtop demo](./docs/assets/mtop-demo.png)
+
 ## 为什么要做这个工具
 
 因为直到今天，macOS 上依然没有一个真正让人称手、又足够理解 Apple Silicon 的终端监控工具。
@@ -30,8 +61,6 @@
 - 在进程交互逻辑上参考了 `htop`
 - 在 GPU 图形展示上参考了 `nvtop`
 - 使用 C++20 与 ncurses 从头实现
-
-`mtop` 不是 `asitop` 的重新包装，而是一个独立实现。
 
 ## 它能显示什么
 
@@ -210,6 +239,30 @@ packaging/homebrew/mtop.rb
 2. 创建版本 tag，例如 `v1.0.0`。
 3. push 这个 tag。
 4. GitHub Actions 会自动构建并把包挂到 Release 上。
+
+## Homebrew Tap 的关系
+
+`mtop` 和 `homebrew-mtop` 应该保持为两个独立仓库。
+
+- `mtop` 是源码仓库
+- `homebrew-mtop` 是 Homebrew tap 仓库
+
+这样做是有意为之：
+
+- 有些用户会手动从源码构建
+- 有些用户只想通过 Homebrew 安装
+- tap 仓库只维护 formula，不需要承载完整源码历史
+
+主仓库里已经包含了公式生成脚本和 tap 同步工作流：
+
+- [scripts/generate_homebrew_formula.sh](./scripts/generate_homebrew_formula.sh)
+- [.github/workflows/update-homebrew-tap.yml](./.github/workflows/update-homebrew-tap.yml)
+
+如果你希望在打 tag 后自动更新 tap，需要在 `mtop` 仓库中配置这个 secret：
+
+- `HOMEBREW_TAP_SSH_KEY`
+
+这个 key 需要对 `lxrzlyr/homebrew-mtop` 有写权限。
 
 ## 项目结构
 

@@ -6,6 +6,37 @@
 
 It aims to feel familiar to people who love `htop` and `nvtop`, but it is designed around the realities of macOS and M-series SoCs: unified memory, asymmetric cores, GPU activity that matters, and power data that is useful when you are tuning local AI workloads.
 
+## Quickstart
+
+Install directly from the Homebrew tap:
+
+```bash
+brew install lxrzlyr/mtop/mtop
+```
+
+Or tap once, then use the short name:
+
+```bash
+brew tap lxrzlyr/mtop
+brew install mtop
+```
+
+Run it:
+
+```bash
+mtop
+```
+
+Preview mode:
+
+```bash
+mtop --demo
+```
+
+## Screenshot
+
+![mtop demo](./docs/assets/mtop-demo.png)
+
 ## Why This Exists
 
 There still is not a truly satisfying, Mac-native terminal monitor for Apple Silicon.
@@ -30,8 +61,6 @@ We want to provide something practical for every user:
 - inspired by `htop` for process interaction
 - inspired by `nvtop` for GPU charting
 - built from scratch in C++20 and ncurses
-
-`mtop` is not a rebrand of `asitop`. It is a separate implementation with different UI goals and a different architecture.
 
 ## What It Shows
 
@@ -210,6 +239,30 @@ Recommended release flow:
 2. Create a version tag such as `v1.0.0`.
 3. Push the tag.
 4. GitHub Actions will build and attach the package to the release.
+
+## Homebrew Tap Relationship
+
+`mtop` and `homebrew-mtop` should remain separate repositories.
+
+- `mtop` is the source repository
+- `homebrew-mtop` is the Homebrew tap repository
+
+That separation is intentional:
+
+- some users want to build from source manually
+- some users want to install with Homebrew
+- the tap should only carry the formula, not the whole source history
+
+This repository includes a formula generator and a tap sync workflow:
+
+- [scripts/generate_homebrew_formula.sh](./scripts/generate_homebrew_formula.sh)
+- [.github/workflows/update-homebrew-tap.yml](./.github/workflows/update-homebrew-tap.yml)
+
+To enable automatic tap updates, add this secret to the `mtop` GitHub repository:
+
+- `HOMEBREW_TAP_SSH_KEY`
+
+That key should be a deploy key or SSH key with write access to `lxrzlyr/homebrew-mtop`.
 
 ## Project Layout
 
