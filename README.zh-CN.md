@@ -128,6 +128,12 @@ root 增强模式：
 sudo ./build/mtop
 ```
 
+安全提示：
+
+- `sudo` 模式是可选增强功能，只建议在你信任的系统上使用
+- 不要在已经被入侵、被破解、被篡改，或整体安全状态可疑的机器上以 root 方式运行 `mtop`
+- root 模式会触发特权遥测采集，因此它的安全边界直接受宿主系统当前安全状态影响
+
 UI 预览模式：
 
 ```bash
@@ -236,7 +242,7 @@ packaging/homebrew/mtop.rb
 推荐发布流程：
 
 1. 正常 push 代码，用 workflow artifacts 检查打包结果。
-2. 创建版本 tag，例如 `v1.0.0`。
+2. 创建版本 tag，例如 `v1.0.1`。
 3. push 这个 tag。
 4. GitHub Actions 会自动构建并把包挂到 Release 上。
 

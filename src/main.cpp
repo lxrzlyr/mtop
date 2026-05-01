@@ -398,7 +398,7 @@ void print_help() {
 }
 
 void print_version() {
-  std::printf("mtop 1.0.0\n");
+  std::printf("mtop 1.0.1\n");
 }
 
 std::string sort_mode_name(SortMode mode) {
