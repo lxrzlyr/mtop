@@ -34,7 +34,7 @@ install(TARGETS mtop RUNTIME DESTINATION bin)
 
 set(CPACK_GENERATOR "TGZ")
 set(CPACK_PACKAGE_NAME "mtop")
-set(CPACK_PACKAGE_VERSION "1.0.0")
+set(CPACK_PACKAGE_VERSION "1.0.1")
 include(CPack)
 
 enable_testing()

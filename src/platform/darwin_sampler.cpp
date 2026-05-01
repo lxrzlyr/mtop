@@ -8,10 +8,13 @@
 #include <mach/mach.h>
 #include <mach/processor_info.h>
 #include <mach/vm_statistics.h>
+#include <fcntl.h>
 #include <pwd.h>
+#include <spawn.h>
 #include <sys/proc.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -73,17 +76,113 @@ std::uint64_t current_uptime_seconds() {
   return now > boot_time.tv_sec ? static_cast<std::uint64_t>(now - boot_time.tv_sec) : 0;
 }
 
-int gpu_core_count() {
-  FILE* pipe = popen("system_profiler -json SPDisplaysDataType 2>/dev/null", "r");
-  if (!pipe) {
-    return 0;
+std::string run_command_capture(const std::vector<std::string>& args, bool discard_stderr) {
+  if (args.empty()) {
+    return "";
   }
+
+  int pipe_fds[2] = {-1, -1};
+  if (pipe(pipe_fds) != 0) {
+    return "";
+  }
+
+  posix_spawn_file_actions_t actions;
+  posix_spawn_file_actions_init(&actions);
+  posix_spawn_file_actions_addclose(&actions, pipe_fds[0]);
+  posix_spawn_file_actions_adddup2(&actions, pipe_fds[1], STDOUT_FILENO);
+  posix_spawn_file_actions_addclose(&actions, pipe_fds[1]);
+
+  int devnull_fd = -1;
+  if (discard_stderr) {
+    devnull_fd = open("/dev/null", O_WRONLY);
+    if (devnull_fd >= 0) {
+      posix_spawn_file_actions_adddup2(&actions, devnull_fd, STDERR_FILENO);
+      posix_spawn_file_actions_addclose(&actions, devnull_fd);
+    }
+  }
+
+  std::vector<char*> argv;
+  argv.reserve(args.size() + 1);
+  for (const auto& arg : args) {
+    argv.push_back(const_cast<char*>(arg.c_str()));
+  }
+  argv.push_back(nullptr);
+
+  static char path_env[] = "PATH=/usr/bin:/bin:/usr/sbin:/sbin";
+  static char lang_env[] = "LANG=C";
+  static char lc_all_env[] = "LC_ALL=C";
+  char* const safe_env[] = {path_env, lang_env, lc_all_env, nullptr};
+
+  pid_t pid = 0;
+  const int spawn_rc = posix_spawn(&pid, args[0].c_str(), &actions, nullptr, argv.data(), safe_env);
+  posix_spawn_file_actions_destroy(&actions);
+  if (devnull_fd >= 0) close(devnull_fd);
+  close(pipe_fds[1]);
+  if (spawn_rc != 0) {
+    close(pipe_fds[0]);
+    return "";
+  }
+
   std::string output;
   std::array<char, 4096> buffer{};
-  while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
-    output += buffer.data();
+  ssize_t bytes = 0;
+  while ((bytes = read(pipe_fds[0], buffer.data(), buffer.size())) > 0) {
+    output.append(buffer.data(), static_cast<std::size_t>(bytes));
   }
-  pclose(pipe);
+  close(pipe_fds[0]);
+  int status = 0;
+  waitpid(pid, &status, 0);
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    return "";
+  }
+  return output;
+}
+
+bool run_command_quiet(const std::vector<std::string>& args) {
+  if (args.empty()) {
+    return false;
+  }
+
+  posix_spawn_file_actions_t actions;
+  posix_spawn_file_actions_init(&actions);
+  const int devnull_fd = open("/dev/null", O_WRONLY);
+  if (devnull_fd >= 0) {
+    posix_spawn_file_actions_adddup2(&actions, devnull_fd, STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, devnull_fd, STDERR_FILENO);
+    posix_spawn_file_actions_addclose(&actions, devnull_fd);
+  }
+
+  std::vector<char*> argv;
+  argv.reserve(args.size() + 1);
+  for (const auto& arg : args) {
+    argv.push_back(const_cast<char*>(arg.c_str()));
+  }
+  argv.push_back(nullptr);
+
+  static char path_env[] = "PATH=/usr/bin:/bin:/usr/sbin:/sbin";
+  static char lang_env[] = "LANG=C";
+  static char lc_all_env[] = "LC_ALL=C";
+  char* const safe_env[] = {path_env, lang_env, lc_all_env, nullptr};
+
+  pid_t pid = 0;
+  const int spawn_rc = posix_spawn(&pid, args[0].c_str(), &actions, nullptr, argv.data(), safe_env);
+  posix_spawn_file_actions_destroy(&actions);
+  if (devnull_fd >= 0) close(devnull_fd);
+  if (spawn_rc != 0) {
+    return false;
+  }
+  int status = 0;
+  waitpid(pid, &status, 0);
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+int gpu_core_count() {
+  const std::string output = run_command_capture(
+      {"/usr/sbin/system_profiler", "-json", "SPDisplaysDataType"},
+      true);
+  if (output.empty()) {
+    return 0;
+  }
   const std::string token = "\"sppci_cores\" : \"";
   const std::size_t pos = output.find(token);
   if (pos == std::string::npos) {
@@ -179,20 +278,6 @@ std::string battery_description() {
   CFRelease(list);
   CFRelease(info);
   return result;
-}
-
-std::string read_command_output(const std::string& command) {
-  FILE* pipe = popen(command.c_str(), "r");
-  if (!pipe) {
-    return "";
-  }
-  std::string output;
-  std::array<char, 4096> buffer{};
-  while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
-    output += buffer.data();
-  }
-  pclose(pipe);
-  return output;
 }
 
 std::string username_for_uid(uid_t uid) {
@@ -618,11 +703,15 @@ class DarwinSampler final : public Sampler {
     int fd = mkstemp(plist_template);
     if (fd >= 0) {
       close(fd);
-      std::string plist_command =
-          "powermetrics --samplers cpu_power,gpu_power,thermal,ane_power -n 1 -i 1000 -f plist -o " +
-          std::string(plist_template) + " </dev/null >/dev/null 2>&1";
-      const int rc = std::system(plist_command.c_str());
-      if (rc == 0) {
+      const bool rc = run_command_quiet({
+          "/usr/bin/powermetrics",
+          "--samplers", "cpu_power,gpu_power,thermal,ane_power",
+          "-n", "1",
+          "-i", "1000",
+          "-f", "plist",
+          "-o", plist_template,
+      });
+      if (rc) {
         std::ifstream input(plist_template, std::ios::binary);
         std::vector<char> bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
         if (!bytes.empty()) {
@@ -713,8 +802,14 @@ class DarwinSampler final : public Sampler {
       std::remove(plist_template);
     }
 
-    const std::string amp_text =
-        read_command_output("powermetrics --samplers tasks,cpu_power --show-process-amp --show-process-ipc -n 1 -i 1000 </dev/null 2>/dev/null");
+    const std::string amp_text = run_command_capture({
+        "/usr/bin/powermetrics",
+        "--samplers", "tasks,cpu_power",
+        "--show-process-amp",
+        "--show-process-ipc",
+        "-n", "1",
+        "-i", "1000",
+    }, true);
     metrics.process_core_mix = parse_amp_core_mix(amp_text);
     return metrics;
   }

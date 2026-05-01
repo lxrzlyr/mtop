@@ -128,6 +128,12 @@ Root-enhanced mode:
 sudo ./build/mtop
 ```
 
+Security note:
+
+- `sudo` mode is optional and should only be used on systems you trust
+- do not run `mtop` as root on machines that are already compromised, jailbroken, tampered with, or otherwise in a questionable security state
+- root mode runs privileged telemetry collection and therefore inherits the security posture of the host system
+
 UI preview mode:
 
 ```bash
@@ -236,7 +242,7 @@ Current workflow file:
 Recommended release flow:
 
 1. Push normal commits and use the workflow artifacts to verify packaging.
-2. Create a version tag such as `v1.0.0`.
+2. Create a version tag such as `v1.0.1`.
 3. Push the tag.
 4. GitHub Actions will build and attach the package to the release.
 
