@@ -11,3 +11,4 @@ _CPack_Packages/
 compile_commands.json
 *.tar.gz
 微信图片_*.png
+REBUILD_PLAN.md
