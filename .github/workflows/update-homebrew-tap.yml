@@ -1,9 +1,6 @@
 name: update-homebrew-tap
 
 on:
-  release:
-    types:
-      - published
   workflow_dispatch:
     inputs:
       version:
@@ -26,25 +23,13 @@ jobs:
 
       - name: Resolve Version
         id: version
-        env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            echo "value=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "value=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
-          fi
+          echo "value=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
 
       - name: Resolve SHA256
         id: sha
         run: |
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            echo "value=${{ github.event.inputs.sha256 }}" >> "$GITHUB_OUTPUT"
-          else
-            VERSION="${{ steps.version.outputs.value }}"
-            curl -L -o "/tmp/mtop-${VERSION}-source.tar.gz" "https://github.com/lxrzlyr/mtop/releases/download/v${VERSION}/mtop-${VERSION}-source.tar.gz"
-            echo "value=$(shasum -a 256 /tmp/mtop-${VERSION}-source.tar.gz | awk '{print $1}')" >> "$GITHUB_OUTPUT"
-          fi
+          echo "value=${{ github.event.inputs.sha256 }}" >> "$GITHUB_OUTPUT"
 
       - name: Start SSH Agent
         uses: webfactory/ssh-agent@v0.9.0

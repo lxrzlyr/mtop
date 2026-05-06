@@ -267,6 +267,8 @@ This repository includes a formula generator and a tap sync workflow:
 
 The tag-based release workflow also performs the tap update and verification step, so the release job fails if the tap does not match the published version.
 
+`update-homebrew-tap.yml` remains available as a manual repair path if a release needs the tap formula to be resynced explicitly.
+
 To enable automatic tap updates, add this secret to the `mtop` GitHub repository:
 
 - `HOMEBREW_TAP_SSH_KEY`
