@@ -245,6 +245,7 @@ Recommended release flow:
 2. Create a version tag such as `v1.0.1`.
 3. Push the tag.
 4. GitHub Actions will build and attach the package to the release.
+5. The same release workflow will update the Homebrew tap and verify the formula matches the new version.
 
 ## Homebrew Tap Relationship
 
@@ -263,6 +264,8 @@ This repository includes a formula generator and a tap sync workflow:
 
 - [scripts/generate_homebrew_formula.sh](./scripts/generate_homebrew_formula.sh)
 - [.github/workflows/update-homebrew-tap.yml](./.github/workflows/update-homebrew-tap.yml)
+
+The tag-based release workflow also performs the tap update and verification step, so the release job fails if the tap does not match the published version.
 
 To enable automatic tap updates, add this secret to the `mtop` GitHub repository:
 
