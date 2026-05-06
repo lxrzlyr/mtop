@@ -78,3 +78,21 @@ jobs:
           fi
           git commit -m "Update mtop formula to v${{ steps.version.outputs.value }}"
           git push origin main
+
+      - name: Verify Tap Update
+        run: |
+          rm -rf /tmp/homebrew-mtop-verify
+          git clone git@github.com:lxrzlyr/homebrew-mtop.git /tmp/homebrew-mtop-verify
+          EXPECTED_VERSION="${{ steps.version.outputs.value }}"
+          ACTUAL_VERSION=$(python3 - <<'PY'
+from pathlib import Path
+import re
+text = Path('/tmp/homebrew-mtop-verify/Formula/mtop.rb').read_text()
+match = re.search(r'/releases/download/v([^/]+)/mtop-([^/]+)-source\.tar\.gz', text)
+print(match.group(1) if match else '')
+PY
+)
+          if [[ "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]]; then
+            echo "Tap verification failed: expected v${EXPECTED_VERSION}, got v${ACTUAL_VERSION}" >&2
+            exit 1
+          fi

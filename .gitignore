@@ -12,3 +12,4 @@ compile_commands.json
 *.tar.gz
 微信图片_*.png
 REBUILD_PLAN.md
+UPGRADE_PLAN.md
