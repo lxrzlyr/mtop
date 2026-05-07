@@ -68,9 +68,12 @@ mtop --demo
 
 - SoC 型号与 Apple Silicon 核心拓扑
 - 按核心类别分组的 CPU 利用率
-- 统一内存与 swap 使用情况
+- `S / P / E` cluster 级 CPU 利用率摘要
+- 统一内存、swap 使用情况，以及派生出的内存压力状态
 - 支持排序、过滤、树形、搜索、选择、nice、signal 的进程主表
-- GPU 利用率
+- 带增强摘要信息的 GPU 利用率面板
+- 二级 `System I/O` 视图中的系统级磁盘 / 网络吞吐
+- 按 GPU-active 过滤的进程视图
 - 电池、启动时长、系统负载
 
 root 增强模式下：
@@ -81,6 +84,12 @@ root 增强模式下：
 - GPU 功率 / 频率增强信息
 - 基于 `powermetrics` 推导的进程核心类别混合信息
 - 基于 `powermetrics` 的进程 IO 与 Energy Impact 列
+
+二级视图与详情交互：
+
+- `System I/O`：主机级磁盘与网络吞吐
+- `GPU Active`：只显示 GPU-active 进程的 focused 视图
+- `Process Detail`：显示完整命令、pid/ppid、运行时、内存、mix/io/power 和 GPU 状态的弹窗
 
 ## 进程扩展列说明
 
@@ -112,15 +121,19 @@ GPU 面板中的 `SOC` 并不是充电功率，也不是整机墙上取电功率
 ## 当前功能
 
 - Apple Silicon-aware CPU 面板
+- CPU cluster 摘要行
 - `htop` 风格的主进程表
 - 增量搜索和过滤
 - 树形模式与展开 / 折叠
 - 键盘与鼠标排序
 - 参考 `nvtop` 的 GPU 曲线面板
-- 统一内存与 swap 可视化
+- 统一内存、swap 与 memory pressure 可视化
+- 二级 `System I/O` / `GPU Active` 视图
+- 进程详情弹窗
 - 默认非 root 模式
 - root 增强采样路径
 - demo 模式
+- 用于终端兼容性排查的独立输入诊断工具
 - `cpack` 打包发布
 
 ## 构建
@@ -173,8 +186,10 @@ UI 预览模式：
 - `+ / - / *`：展开 / 折叠 / 切换树节点
 - `F6` 或 `>` 或 `.`：排序菜单
 - `N / P / M / T / A / I`：PID / CPU / MEM / TIME / NAME / 反转排序
-- `F7 / F8` 或 `] / [`：调整 nice
+- `F7 / F8`、`Tab / Shift-Tab` 或 `{ / }`：切换前后视图
+- `] / [`：调整 nice
 - `F9` 或 `k`：发送信号
+- `d`：打开进程详情弹窗
 - `F10` 或 `q`：退出
 - 鼠标：点击表头排序，点击进程行选中，点击函数栏按钮触发动作
 
@@ -208,6 +223,8 @@ CLI 覆盖：
 ./build/mtop --refresh-ms 500
 ./build/mtop --theme mono
 ./build/mtop --config /path/to/config
+./build/mtop --debug-input
+./build/mtop --debug-input --debug-log /tmp/mtop-input.log
 ```
 
 ## 安装与打包

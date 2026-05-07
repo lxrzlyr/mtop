@@ -1,13 +1,17 @@
 #include "monitor/sampler.hpp"
 #include "monitor/apple_gpu.hpp"
+#include "monitor/metrics.hpp"
+#include "monitor/root_metrics_parser.hpp"
 
 #include <CoreFoundation/CoreFoundation.h>
+#include <ifaddrs.h>
 #include <IOKit/ps/IOPowerSources.h>
 #include <IOKit/ps/IOPSKeys.h>
 #include <libproc.h>
 #include <mach/mach.h>
 #include <mach/processor_info.h>
 #include <mach/vm_statistics.h>
+#include <net/if.h>
 #include <fcntl.h>
 #include <pwd.h>
 #include <spawn.h>
@@ -298,8 +302,6 @@ char process_state_char(uint32_t status) {
   }
 }
 
-std::string trim_copy(const std::string& text);
-
 std::string process_command(pid_t pid, const proc_bsdinfo& bsd_info) {
   char path_buffer[PROC_PIDPATHINFO_MAXSIZE] = {};
   if (proc_pidpath(pid, path_buffer, sizeof(path_buffer)) > 0) {
@@ -312,47 +314,6 @@ std::string process_command(pid_t pid, const proc_bsdinfo& bsd_info) {
     return bsd_info.pbi_comm;
   }
   return "unknown";
-}
-
-std::vector<std::string> split_multi_space(const std::string& line) {
-  std::vector<std::string> result;
-  std::string current;
-  int space_run = 0;
-  for (char ch : line) {
-    if (ch == ' ') {
-      ++space_run;
-      if (space_run >= 2) {
-        if (!current.empty()) {
-          result.push_back(trim_copy(current));
-          current.clear();
-        }
-      } else if (!current.empty()) {
-        current.push_back(ch);
-      }
-    } else {
-      space_run = 0;
-      current.push_back(ch);
-    }
-  }
-  if (!current.empty()) {
-    result.push_back(trim_copy(current));
-  }
-  return result;
-}
-
-std::string trim_copy(const std::string& text) {
-  const std::size_t start = text.find_first_not_of(" \t\r\n");
-  if (start == std::string::npos) {
-    return "";
-  }
-  const std::size_t end = text.find_last_not_of(" \t\r\n");
-  return text.substr(start, end - start + 1);
-}
-
-std::string lowercase_copy(std::string text) {
-  std::transform(text.begin(), text.end(), text.begin(),
-                 [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-  return text;
 }
 
 std::string compact_count(double value) {
@@ -371,238 +332,25 @@ std::string compact_count(double value) {
   return buffer;
 }
 
-std::string compact_io_bytes(double value) {
-  static const char* units[] = {"B", "K", "M", "G", "T"};
+std::string compact_binary_bytes(std::uint64_t value) {
+  static const char* units[] = {"B", "Ki", "Mi", "Gi", "Ti"};
+  double current = static_cast<double>(value);
   int unit = 0;
-  while (std::fabs(value) >= 1024.0 && unit < 4) {
-    value /= 1024.0;
+  while (current >= 1024.0 && unit < 4) {
+    current /= 1024.0;
     ++unit;
   }
   char buffer[16];
-  if (unit == 0 || std::fabs(value) >= 10.0) {
-    std::snprintf(buffer, sizeof(buffer), "%.0f%s", value, units[unit]);
+  if (unit == 0) {
+    std::snprintf(buffer, sizeof(buffer), "%llu%s",
+                  static_cast<unsigned long long>(value),
+                  units[unit]);
+  } else if (current >= 10.0) {
+    std::snprintf(buffer, sizeof(buffer), "%.0f%s", current, units[unit]);
   } else {
-    std::snprintf(buffer, sizeof(buffer), "%.1f%s", value, units[unit]);
+    std::snprintf(buffer, sizeof(buffer), "%.1f%s", current, units[unit]);
   }
   return buffer;
-}
-
-bool is_numeric_field(const std::string& text) {
-  const std::string trimmed = trim_copy(text);
-  if (trimmed.empty()) {
-    return false;
-  }
-  bool has_digit = false;
-  for (char ch : trimmed) {
-    const unsigned char uch = static_cast<unsigned char>(ch);
-    if (std::isdigit(uch)) {
-      has_digit = true;
-      continue;
-    }
-    if (ch == '.' || ch == '+' || ch == '-' || ch == 'e' || ch == 'E') {
-      continue;
-    }
-    return false;
-  }
-  return has_digit;
-}
-
-std::vector<std::string> split_numeric_subfields(const std::string& field) {
-  std::vector<std::string> parts;
-  std::istringstream stream(field);
-  std::string part;
-  while (stream >> part) {
-    if (!is_numeric_field(part)) {
-      return {};
-    }
-    parts.push_back(part);
-  }
-  if (parts.size() < 2) {
-    return {};
-  }
-  return parts;
-}
-
-void split_merged_numeric_fields(std::vector<std::string>& fields, std::size_t expected_size) {
-  for (std::string& field : fields) {
-    field = trim_copy(field);
-  }
-  while (fields.size() < expected_size) {
-    bool changed = false;
-    for (std::size_t index = 0; index < fields.size(); ++index) {
-      const std::string& field = fields[index];
-      std::vector<std::string> parts = split_numeric_subfields(field);
-      if (parts.empty()) {
-        continue;
-      }
-      fields[index] = std::move(parts.front());
-      fields.insert(fields.begin() + static_cast<std::ptrdiff_t>(index + 1), parts.begin() + 1, parts.end());
-      changed = true;
-      break;
-    }
-    if (!changed) {
-      break;
-    }
-  }
-}
-
-std::vector<std::string> expand_amp_header(const std::vector<std::string>& fields) {
-  std::vector<std::string> expanded;
-  for (const std::string& field : fields) {
-    if (field.rfind("Deadlines (", 0) == 0) {
-      expanded.push_back("Deadline<2ms");
-      expanded.push_back("Deadline2-5ms");
-    } else if (field.rfind("Wakeups (", 0) == 0) {
-      expanded.push_back("WakeupsIntr");
-      expanded.push_back("WakeupsPkgIdle");
-    } else {
-      const std::size_t pos = field.find(" %");
-      if (pos != std::string::npos) {
-        expanded.push_back(field.substr(0, pos));
-        expanded.push_back("%" + field.substr(pos + 2));
-      } else {
-        expanded.push_back(field);
-      }
-    }
-  }
-  return expanded;
-}
-
-struct AmpData {
-  std::map<int, std::string> core_mix;
-  std::map<int, std::string> io;
-  std::map<int, std::string> power;
-};
-
-AmpData parse_amp_data(const std::string& text, bool has_super) {
-  AmpData result;
-  std::istringstream input(text);
-  std::string line;
-  bool in_tasks = false;
-  std::vector<std::string> header;
-  while (std::getline(input, line)) {
-    const std::string trimmed = trim_copy(line);
-    if (trimmed.find("*** Running tasks ***") != std::string::npos) {
-      in_tasks = true;
-      continue;
-    }
-    if (!in_tasks) {
-      continue;
-    }
-    if (trimmed.rfind("****", 0) == 0) {
-      break;
-    }
-    if (trimmed.empty()) {
-      continue;
-    }
-    if (trimmed.rfind("Name", 0) == 0 && trimmed.find("CPU ms/s") != std::string::npos) {
-      header = expand_amp_header(split_multi_space(trimmed));
-      continue;
-    }
-    if (header.empty()) {
-      continue;
-    }
-    std::vector<std::string> values = split_multi_space(trimmed);
-    split_merged_numeric_fields(values, header.size());
-    if (values.size() != header.size()) {
-      continue;
-    }
-    std::map<std::string, std::string> row;
-    for (std::size_t i = 0; i < header.size(); ++i) {
-      row[trim_copy(header[i])] = trim_copy(values[i]);
-    }
-    const auto id_it = row.find("ID") != row.end() ? row.find("ID") : row.find("PID");
-    if (id_it == row.end()) {
-      continue;
-    }
-    const int pid = std::atoi(id_it->second.c_str());
-    if (pid <= 0) {
-      continue;
-    }
-
-    // Core mix
-    double primary_percent = 0.0;
-    const char* primary_label = nullptr;
-    const char* secondary_label = nullptr;
-
-    if (row.count("%SCPU")) {
-      primary_percent = std::atof(row["%SCPU"].c_str());
-      primary_label = has_super ? "S" : "P";
-      secondary_label = has_super ? "P" : "E";
-    } else if (row.count("SCPU ms/s") && row.count("CPU ms/s")) {
-      const double total = std::atof(row["CPU ms/s"].c_str());
-      const double primary_ms = std::atof(row["SCPU ms/s"].c_str());
-      if (total > 0.0) {
-        primary_percent = primary_ms * 100.0 / total;
-      }
-      primary_label = has_super ? "S" : "P";
-      secondary_label = has_super ? "P" : "E";
-    } else if (row.count("%PCPU")) {
-      primary_percent = std::atof(row["%PCPU"].c_str());
-      primary_label = "P";
-      secondary_label = "E";
-    } else if (row.count("PCPU ms/s") && row.count("CPU ms/s")) {
-      const double total = std::atof(row["CPU ms/s"].c_str());
-      const double primary_ms = std::atof(row["PCPU ms/s"].c_str());
-      if (total > 0.0) {
-        primary_percent = primary_ms * 100.0 / total;
-      }
-      primary_label = "P";
-      secondary_label = "E";
-    }
-
-    if (!primary_label) {
-      primary_label = "P";
-      secondary_label = "E";
-    }
-
-    const double secondary_percent = std::max(0.0, 100.0 - primary_percent);
-    char buffer[64];
-    std::snprintf(buffer, sizeof(buffer), "%s:%d%% %s:%d%%",
-                  primary_label,
-                  static_cast<int>(std::round(primary_percent)),
-                  secondary_label,
-                  static_cast<int>(std::round(secondary_percent)));
-    result.core_mix[pid] = buffer;
-
-    // IO: look for disk IO columns
-    double disk_read = 0.0, disk_write = 0.0;
-    bool saw_io_column = false;
-    for (const auto& [col, val] : row) {
-      const std::string lower_col = lowercase_copy(col);
-      const bool io_column = lower_col.find("disk") != std::string::npos ||
-                             lower_col.find("io") != std::string::npos ||
-                             lower_col.find("bytes") != std::string::npos;
-      if (!io_column) {
-        continue;
-      }
-      saw_io_column = true;
-      if (lower_col.find("read") != std::string::npos) {
-        disk_read += std::atof(val.c_str());
-      } else if (lower_col.find("write") != std::string::npos ||
-                 lower_col.find("written") != std::string::npos) {
-        disk_write += std::atof(val.c_str());
-      }
-    }
-    if (saw_io_column) {
-      char buf[32];
-      std::snprintf(buf, sizeof(buf), "%s/%s", compact_io_bytes(disk_read).c_str(), compact_io_bytes(disk_write).c_str());
-      result.io[pid] = buf;
-    }
-
-    // Power: look for energy impact column
-    for (const auto& [col, val] : row) {
-      const std::string lower_col = lowercase_copy(col);
-      if (lower_col.find("energy") != std::string::npos || lower_col.find("impact") != std::string::npos) {
-        const double energy = std::atof(val.c_str());
-        char buf[16];
-        std::snprintf(buf, sizeof(buf), "%.0f", energy);
-        result.power[pid] = buf;
-        break;
-      }
-    }
-  }
-  return result;
 }
 
 struct RootMetrics {
@@ -615,10 +363,42 @@ struct RootMetrics {
   double gpu_power_watts = 0.0;
   double total_power_watts = 0.0;
   int gpu_frequency_mhz = 0;
+   std::map<std::string, int> cluster_frequency_mhz;
+   std::map<std::string, double> cluster_power_watts;
   std::map<int, std::string> process_core_mix;
   std::map<int, std::string> process_io;
   std::map<int, std::string> process_power;
 };
+
+struct HostNetworkCounters {
+  std::uint64_t rx_bytes = 0;
+  std::uint64_t tx_bytes = 0;
+  bool available = false;
+};
+
+std::optional<HostNetworkCounters> sample_host_network_counters() {
+  ifaddrs* interfaces = nullptr;
+  if (getifaddrs(&interfaces) != 0 || interfaces == nullptr) {
+    return std::nullopt;
+  }
+
+  HostNetworkCounters counters;
+  for (ifaddrs* current = interfaces; current != nullptr; current = current->ifa_next) {
+    if (!current->ifa_name || !current->ifa_data) {
+      continue;
+    }
+    if ((current->ifa_flags & IFF_UP) == 0 || (current->ifa_flags & IFF_LOOPBACK) != 0) {
+      continue;
+    }
+    const auto* data = reinterpret_cast<const if_data*>(current->ifa_data);
+    counters.rx_bytes += data->ifi_ibytes;
+    counters.tx_bytes += data->ifi_obytes;
+    counters.available = true;
+  }
+
+  freeifaddrs(interfaces);
+  return counters.available ? std::optional<HostNetworkCounters>(counters) : std::nullopt;
+}
 
 class DarwinSampler final : public Sampler {
  public:
@@ -628,6 +408,7 @@ class DarwinSampler final : public Sampler {
     snapshot_.gpu_core_count = gpu_core_count();
     snapshot_.capabilities.root_mode = geteuid() == 0;
     snapshot_.cpu_cores = build_core_topology();
+    rebuild_cpu_clusters();
     for (const auto& level : perf_levels()) {
       snapshot_.perf_levels.push_back(level.name + ":" + std::to_string(level.logicalcpu));
     }
@@ -651,6 +432,7 @@ class DarwinSampler final : public Sampler {
   SystemSnapshot sample() override {
     sample_load();
     sample_memory();
+    sample_system_io();
     sample_battery();
     sample_cpu();
     sample_root_metrics();
@@ -693,6 +475,63 @@ class DarwinSampler final : public Sampler {
       snapshot_.swap_total_bytes = swap.xsu_total;
       snapshot_.swap_used_bytes = swap.xsu_used;
     }
+    snapshot_.memory_pressure = derive_memory_pressure(snapshot_);
+    snapshot_.swap_history_bytes.push_back(snapshot_.swap_used_bytes);
+    constexpr std::size_t kSwapHistoryLimit = 60;
+    if (snapshot_.swap_history_bytes.size() > kSwapHistoryLimit) {
+      snapshot_.swap_history_bytes.erase(
+          snapshot_.swap_history_bytes.begin(),
+          snapshot_.swap_history_bytes.begin() + (snapshot_.swap_history_bytes.size() - kSwapHistoryLimit));
+    }
+  }
+
+  void sample_system_io() {
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed_seconds = last_io_sample_time_.time_since_epoch().count() == 0
+                                       ? 0.0
+                                       : std::chrono::duration<double>(now - last_io_sample_time_).count();
+    last_io_sample_time_ = now;
+
+    snapshot_.disk_io.available = false;
+    snapshot_.disk_io.read_bytes_per_sec = 0;
+    snapshot_.disk_io.write_bytes_per_sec = 0;
+    snapshot_.network_io.available = false;
+    snapshot_.network_io.rx_bytes_per_sec = 0;
+    snapshot_.network_io.tx_bytes_per_sec = 0;
+
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    vm_statistics64_data_t vm_stat{};
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          reinterpret_cast<host_info64_t>(&vm_stat), &count) == KERN_SUCCESS) {
+      const std::uint64_t page_size = static_cast<std::uint64_t>(sysctl_scalar<int>("hw.pagesize").value_or(16384));
+      const std::uint64_t cumulative_read_bytes = vm_stat.pageins * page_size;
+      const std::uint64_t cumulative_write_bytes = vm_stat.pageouts * page_size;
+      if (elapsed_seconds > 0.0 && previous_disk_read_bytes_.has_value() && previous_disk_write_bytes_.has_value() &&
+          cumulative_read_bytes >= *previous_disk_read_bytes_ && cumulative_write_bytes >= *previous_disk_write_bytes_) {
+        snapshot_.disk_io.available = true;
+        snapshot_.disk_io.read_bytes_per_sec = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(cumulative_read_bytes - *previous_disk_read_bytes_) / elapsed_seconds));
+        snapshot_.disk_io.write_bytes_per_sec = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(cumulative_write_bytes - *previous_disk_write_bytes_) / elapsed_seconds));
+      }
+      previous_disk_read_bytes_ = cumulative_read_bytes;
+      previous_disk_write_bytes_ = cumulative_write_bytes;
+    }
+
+    const std::optional<HostNetworkCounters> network_counters = sample_host_network_counters();
+    if (network_counters.has_value()) {
+      if (elapsed_seconds > 0.0 && previous_network_rx_bytes_.has_value() && previous_network_tx_bytes_.has_value() &&
+          network_counters->rx_bytes >= *previous_network_rx_bytes_ &&
+          network_counters->tx_bytes >= *previous_network_tx_bytes_) {
+        snapshot_.network_io.available = true;
+        snapshot_.network_io.rx_bytes_per_sec = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(network_counters->rx_bytes - *previous_network_rx_bytes_) / elapsed_seconds));
+        snapshot_.network_io.tx_bytes_per_sec = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(network_counters->tx_bytes - *previous_network_tx_bytes_) / elapsed_seconds));
+      }
+      previous_network_rx_bytes_ = network_counters->rx_bytes;
+      previous_network_tx_bytes_ = network_counters->tx_bytes;
+    }
   }
 
   void sample_battery() {
@@ -718,14 +557,17 @@ class DarwinSampler final : public Sampler {
     char buffer[128];
     if (snapshot_.capabilities.root_mode && cached_root_metrics_.available) {
       std::snprintf(buffer, sizeof(buffer),
-                    "%.0f%% @ %d MHz | %.2fW",
+                    "%.0f%% @ %d MHz | GPU %.2fW | SoC %.2fW",
                     probe.utilization_percent,
                     cached_root_metrics_.gpu_frequency_mhz,
-                    cached_root_metrics_.gpu_power_watts);
+                    cached_root_metrics_.gpu_power_watts,
+                    cached_root_metrics_.total_power_watts);
     } else {
       std::snprintf(buffer, sizeof(buffer),
-                    "%.0f%% total util",
-                    probe.utilization_percent);
+                    "%.0f%% util | Mem %s/%s",
+                    probe.utilization_percent,
+                    compact_binary_bytes(probe.used_memory_bytes).c_str(),
+                    compact_binary_bytes(probe.total_memory_bytes).c_str());
     }
     snapshot_.gpu_summary = buffer;
     snapshot_.gpu_power_watts = cached_root_metrics_.gpu_power_watts;
@@ -763,6 +605,7 @@ class DarwinSampler final : public Sampler {
       }
       snapshot_.cpu_cores[cpu].utilization_percent = percent;
     }
+    refresh_cpu_clusters();
 
     if (previous_cpu_info_ != nullptr) {
       vm_deallocate(mach_task_self(),
@@ -772,6 +615,62 @@ class DarwinSampler final : public Sampler {
     previous_cpu_info_ = cpu_info;
     previous_cpu_info_count_ = cpu_info_count;
     previous_cpu_count_ = cpu_count;
+  }
+
+  void rebuild_cpu_clusters() {
+    snapshot_.cpu_clusters.clear();
+    std::map<std::string, int> core_counts;
+    for (const auto& core : snapshot_.cpu_cores) {
+      core_counts[core.cluster_type] += 1;
+    }
+    for (const auto& level : perf_levels()) {
+      CpuClusterSnapshot cluster{};
+      cluster.name = level.name;
+      cluster.label = level.name == "Super" ? 'S' : level.name == "Performance" ? 'P' : level.name == "Efficiency" ? 'E' : 'C';
+      cluster.core_count = core_counts[level.name];
+      snapshot_.cpu_clusters.push_back(cluster);
+    }
+  }
+
+  void refresh_cpu_clusters() {
+    if (snapshot_.cpu_clusters.empty()) {
+      rebuild_cpu_clusters();
+    }
+
+    for (auto& cluster : snapshot_.cpu_clusters) {
+      double total_util = 0.0;
+      int counted = 0;
+      for (const auto& core : snapshot_.cpu_cores) {
+        if (core.cluster_type != cluster.name) {
+          continue;
+        }
+        total_util += core.utilization_percent;
+        ++counted;
+      }
+      cluster.core_count = counted;
+      cluster.utilization_percent = counted > 0 ? total_util / static_cast<double>(counted) : 0.0;
+      cluster.frequency_available = false;
+      cluster.frequency_mhz = 0;
+      cluster.power_available = false;
+      cluster.power_watts = 0.0;
+    }
+
+    if (!snapshot_.capabilities.root_mode) {
+      return;
+    }
+
+    for (auto& cluster : snapshot_.cpu_clusters) {
+      const auto freq_it = cached_root_metrics_.cluster_frequency_mhz.find(cluster.name);
+      if (freq_it != cached_root_metrics_.cluster_frequency_mhz.end() && freq_it->second > 0) {
+        cluster.frequency_available = true;
+        cluster.frequency_mhz = freq_it->second;
+      }
+      const auto power_it = cached_root_metrics_.cluster_power_watts.find(cluster.name);
+      if (power_it != cached_root_metrics_.cluster_power_watts.end() && power_it->second > 0.0) {
+        cluster.power_available = true;
+        cluster.power_watts = power_it->second;
+      }
+    }
   }
 
   void sample_processes() {
@@ -1053,6 +952,11 @@ class DarwinSampler final : public Sampler {
   natural_t previous_cpu_count_ = 0;
   std::map<pid_t, std::uint64_t> previous_process_times_{};
   std::chrono::steady_clock::time_point last_process_sample_time_{};
+  std::chrono::steady_clock::time_point last_io_sample_time_{};
+  std::optional<std::uint64_t> previous_disk_read_bytes_{};
+  std::optional<std::uint64_t> previous_disk_write_bytes_{};
+  std::optional<std::uint64_t> previous_network_rx_bytes_{};
+  std::optional<std::uint64_t> previous_network_tx_bytes_{};
   std::set<int> gpu_active_pid_set_{};
   RootMetrics cached_root_metrics_{};
   RootMetrics shared_root_metrics_{};

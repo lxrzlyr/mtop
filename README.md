@@ -68,9 +68,12 @@ Without root:
 
 - SoC model and Apple Silicon core topology
 - per-core CPU utilization grouped by core class
-- unified memory and swap usage
+- cluster-level CPU utilization summaries for `S / P / E`
+- unified memory, swap usage, and derived memory pressure
 - process list with sorting, filtering, tree mode, search, selection, nice, and signal actions
-- GPU utilization
+- GPU utilization with richer panel summaries
+- system-level disk and network throughput in a secondary `System I/O` view
+- GPU-active filtered process view
 - battery, uptime, and load average
 
 With root:
@@ -81,6 +84,12 @@ With root:
 - GPU power / frequency enrichment
 - process core-class mix derived from `powermetrics`
 - process IO and energy-impact columns derived from `powermetrics`
+
+Secondary views and detail interactions:
+
+- `System I/O`: host-level disk and network throughput
+- `GPU Active`: focused process view filtered by GPU-active state
+- `Process Detail`: popup with full command, pid/ppid, runtime, memory, mix, io, power, and GPU state
 
 ## Process Extension Columns
 
@@ -112,15 +121,19 @@ That means:
 ## Current Feature Set
 
 - Apple Silicon-aware CPU panel with core-class grouping
+- compact CPU cluster summary line
 - `htop`-style main process table
 - incremental search and filter
 - tree mode with expand / collapse
 - sorting from keyboard and mouse
 - GPU chart panel inspired by `nvtop`
-- unified memory and swap visualization
+- unified memory, swap, and pressure visualization
+- secondary `System I/O` and `GPU Active` views
+- process detail popup
 - non-root default mode
 - root-enhanced sampling path
 - demo mode for UI iteration
+- standalone input diagnostic utility for terminal compatibility debugging
 - release packaging with `cpack`
 
 ## Build
@@ -173,8 +186,10 @@ Main interaction:
 - `+ / - / *`: expand / collapse / toggle tree nodes
 - `F6` or `>` or `.`: sort menu
 - `N / P / M / T / A / I`: PID / CPU / MEM / TIME / NAME / invert
-- `F7 / F8` or `] / [`: renice
+- `F7 / F8`, `Tab / Shift-Tab`, or `{ / }`: previous / next secondary view
+- `] / [`: renice
 - `F9` or `k`: send signal
+- `d`: process detail popup
 - `F10` or `q`: quit
 - mouse: click process headers to sort, click rows to select, click function bar buttons
 
@@ -208,6 +223,8 @@ CLI overrides:
 ./build/mtop --refresh-ms 500
 ./build/mtop --theme mono
 ./build/mtop --config /path/to/config
+./build/mtop --debug-input
+./build/mtop --debug-input --debug-log /tmp/mtop-input.log
 ```
 
 ## Package And Install

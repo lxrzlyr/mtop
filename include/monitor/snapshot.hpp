@@ -6,11 +6,41 @@
 
 namespace monitor {
 
+enum class MemoryPressureLevel {
+  Unknown,
+  Normal,
+  Warn,
+  Critical,
+};
+
 struct BatterySnapshot {
   bool available = false;
   bool on_ac_power = false;
   double percent = 0.0;
   std::string description = "N/A";
+};
+
+struct CpuClusterSnapshot {
+  std::string name = "Unknown";
+  char label = 'C';
+  int core_count = 0;
+  double utilization_percent = 0.0;
+  int frequency_mhz = 0;
+  double power_watts = 0.0;
+  bool frequency_available = false;
+  bool power_available = false;
+};
+
+struct DiskIoSnapshot {
+  bool available = false;
+  std::uint64_t read_bytes_per_sec = 0;
+  std::uint64_t write_bytes_per_sec = 0;
+};
+
+struct NetworkIoSnapshot {
+  bool available = false;
+  std::uint64_t rx_bytes_per_sec = 0;
+  std::uint64_t tx_bytes_per_sec = 0;
 };
 
 struct CpuCoreSnapshot {
@@ -67,8 +97,10 @@ struct SystemSnapshot {
   std::uint64_t memory_purgeable_bytes = 0;
   std::uint64_t memory_compressed_bytes = 0;
   std::uint64_t memory_inactive_bytes = 0;
+  MemoryPressureLevel memory_pressure = MemoryPressureLevel::Unknown;
   std::uint64_t swap_used_bytes = 0;
   std::uint64_t swap_total_bytes = 0;
+  std::vector<std::uint64_t> swap_history_bytes;
   std::uint64_t uptime_seconds = 0;
 
   BatterySnapshot battery;
@@ -83,8 +115,11 @@ struct SystemSnapshot {
   int gpu_frequency_mhz = 0;
   std::uint64_t gpu_memory_used_bytes = 0;
   std::uint64_t gpu_memory_total_bytes = 0;
+  DiskIoSnapshot disk_io;
+  NetworkIoSnapshot network_io;
 
   std::vector<CpuCoreSnapshot> cpu_cores;
+  std::vector<CpuClusterSnapshot> cpu_clusters;
   std::vector<ProcessSnapshot> processes;
 };
 

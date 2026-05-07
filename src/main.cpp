@@ -16,16 +16,20 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+#include <cstdarg>
 
 #include <curses.h>
 #include <sys/resource.h>
 
 #include "monitor/config.hpp"
+#include "monitor/input_logic.hpp"
+#include "monitor/input_parser.hpp"
+#include "monitor/metrics.hpp"
 #include "monitor/sampler.hpp"
+#include "monitor/ui_support.hpp"
 
 namespace {
 
-enum class SortMode { Pid, Cpu, Mem, Time, Name };
 enum class PromptMode { None, Search, Filter, Sort, Signal };
 enum class SetupField { Theme, CachedMemory, Refresh, Done };
 constexpr int kFunctionKeyCount = 10;
@@ -37,11 +41,12 @@ struct ButtonBounds {
 };
 
 struct UiState {
-  SortMode sort = SortMode::Cpu;
+  monitor::SortMode sort = monitor::SortMode::Cpu;
   bool tree_mode = false;
-  int page = 0;
+  int table_page = 0;
   std::optional<int> selected_pid;
   PromptMode prompt_mode = PromptMode::None;
+  monitor::ViewMode view_mode = monitor::ViewMode::Overview;
   std::string filter;
   std::string search;
   std::string prompt_buffer;
@@ -54,6 +59,7 @@ struct UiState {
   int sort_direction = -1;
   bool show_help = false;
   bool show_setup = false;
+  bool show_process_detail = false;
   bool show_cached_memory = false;
   SetupField setup_field = SetupField::Theme;
   ButtonBounds footer_buttons[kFunctionKeyCount];
@@ -64,7 +70,9 @@ struct RuntimeOptions {
   bool demo = false;
   bool help = false;
   bool version = false;
+  bool debug_input = false;
   std::string config_path;
+  std::string debug_log_path;
   std::optional<int> refresh_ms;
   std::optional<std::string> theme;
   std::optional<int> process_limit;
@@ -94,23 +102,30 @@ struct ProcessViewMetrics {
   int selected_index = -1;
 };
 
+struct IoHistory {
+  std::vector<double> disk_read;
+  std::vector<double> disk_write;
+  std::vector<double> net_rx;
+  std::vector<double> net_tx;
+};
+
 struct ProcessColumn {
   const char* title;
   int width;
-  SortMode sort_mode;
+  monitor::SortMode sort_mode;
   bool sortable;
 };
 
 constexpr ProcessColumn kProcessColumns[] = {
-    {"PID", 5, SortMode::Pid, true},
-    {"USER", 10, SortMode::Name, false},
-    {"S", 1, SortMode::Pid, false},
-    {"CPU%", 5, SortMode::Cpu, true},
-    {"MIX", 12, SortMode::Pid, false},
-    {"MEM%", 10, SortMode::Mem, true},
-    {"GPU", 3, SortMode::Pid, false},
-    {"IO", 11, SortMode::Pid, false},
-    {"PWR", 5, SortMode::Pid, false},
+    {"PID", 5, monitor::SortMode::Pid, true},
+    {"USER", 10, monitor::SortMode::Name, false},
+    {"S", 1, monitor::SortMode::Pid, false},
+    {"CPU%", 5, monitor::SortMode::Cpu, true},
+    {"MIX", 12, monitor::SortMode::Pid, false},
+    {"MEM%", 10, monitor::SortMode::Mem, true},
+    {"GPU", 3, monitor::SortMode::Pid, false},
+    {"IO", 11, monitor::SortMode::Pid, false},
+    {"PWR", 5, monitor::SortMode::Pid, false},
 };
 
 RuntimeOptions parse_args(int argc, char** argv) {
@@ -123,6 +138,10 @@ RuntimeOptions parse_args(int argc, char** argv) {
       options.help = true;
     } else if (arg == "--version" || arg == "-v") {
       options.version = true;
+    } else if (arg == "--debug-input") {
+      options.debug_input = true;
+    } else if (arg == "--debug-log" && i + 1 < argc) {
+      options.debug_log_path = argv[++i];
     } else if (arg == "--config" && i + 1 < argc) {
       options.config_path = argv[++i];
     } else if (arg == "--refresh-ms" && i + 1 < argc) {
@@ -164,6 +183,27 @@ std::string compact_bytes(std::uint64_t value) {
                   units[unit]);
   } else {
     std::snprintf(buffer, sizeof(buffer), "%.0f%s", current, units[unit]);
+  }
+  return buffer;
+}
+
+std::string compact_bytes_with_decimal(std::uint64_t value) {
+  static const char* units[] = {"B", "Ki", "Mi", "Gi", "Ti"};
+  double current = static_cast<double>(value);
+  int unit = 0;
+  while (current >= 1024.0 && unit < 4) {
+    current /= 1024.0;
+    ++unit;
+  }
+  char buffer[32];
+  if (unit == 0) {
+    std::snprintf(buffer, sizeof(buffer), "%llu%s",
+                  static_cast<unsigned long long>(value),
+                  units[unit]);
+  } else if (current >= 10.0) {
+    std::snprintf(buffer, sizeof(buffer), "%.0f%s", current, units[unit]);
+  } else {
+    std::snprintf(buffer, sizeof(buffer), "%.1f%s", current, units[unit]);
   }
   return buffer;
 }
@@ -280,7 +320,7 @@ void draw_process_extension_cell(WINDOW* window,
   }
 }
 
-std::optional<SortMode> process_sort_from_header_x(int local_x) {
+std::optional<monitor::SortMode> process_sort_from_header_x(int local_x) {
   for (int column = 0; column < static_cast<int>(std::size(kProcessColumns)); ++column) {
     const ProcessColumn& def = kProcessColumns[column];
     const int x0 = process_column_offset(column);
@@ -292,11 +332,86 @@ std::optional<SortMode> process_sort_from_header_x(int local_x) {
   return std::nullopt;
 }
 
+std::optional<int> process_column_index_from_header_x(int local_x) {
+  for (int column = 0; column < static_cast<int>(std::size(kProcessColumns)); ++column) {
+    const ProcessColumn& def = kProcessColumns[column];
+    const int x0 = process_column_offset(column);
+    const int x1 = x0 + def.width - 1;
+    if (local_x >= x0 && local_x <= x1) {
+      return column;
+    }
+  }
+  return std::nullopt;
+}
+
 struct MeterSegment {
   double percent = 0.0;
   int color_pair = 1;
   int attr = A_NORMAL;
 };
+
+FILE* g_input_debug_log = nullptr;
+
+void input_debug_log(const char* fmt, ...) {
+  if (!g_input_debug_log) {
+    return;
+  }
+  va_list args;
+  va_start(args, fmt);
+  std::vfprintf(g_input_debug_log, fmt, args);
+  va_end(args);
+  std::fputc('\n', g_input_debug_log);
+  std::fflush(g_input_debug_log);
+}
+
+void set_input_debug_log_path(const std::string& path) {
+  if (g_input_debug_log) {
+    std::fclose(g_input_debug_log);
+    g_input_debug_log = nullptr;
+  }
+  g_input_debug_log = std::fopen(path.c_str(), "w");
+  if (g_input_debug_log) {
+    input_debug_log("debug log started: %s", path.c_str());
+  }
+}
+
+void close_input_debug_log() {
+  if (!g_input_debug_log) {
+    return;
+  }
+  input_debug_log("debug log closed");
+  std::fclose(g_input_debug_log);
+  g_input_debug_log = nullptr;
+}
+
+void log_input_capabilities(mmask_t active_mask) {
+  const char* term = std::getenv("TERM");
+  input_debug_log("TERM=%s", term ? term : "(null)");
+  input_debug_log("KEY_F1=%d KEY_F2=%d KEY_F10=%d KEY_MOUSE=%d KEY_BTAB=%d",
+                  KEY_F(1), KEY_F(2), KEY_F(10), KEY_MOUSE, KEY_BTAB);
+  input_debug_log("has_key(F1)=%d has_key(F2)=%d has_key(F10)=%d has_key(MOUSE)=%d has_key(BTAB)=%d",
+                  has_key(KEY_F(1)), has_key(KEY_F(2)), has_key(KEY_F(10)), has_key(KEY_MOUSE), has_key(KEY_BTAB));
+  input_debug_log("mousemask active=%lu", static_cast<unsigned long>(active_mask));
+}
+
+void clear_terminal_mouse_reporting() {
+  static constexpr const char* sequence =
+      "\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?1015l";
+  std::fwrite(sequence, 1, std::strlen(sequence), stdout);
+  std::fflush(stdout);
+}
+
+void enable_terminal_mouse_reporting() {
+  static constexpr const char* sequence =
+      "\033[?1000h\033[?1006h";
+  std::fwrite(sequence, 1, std::strlen(sequence), stdout);
+  std::fflush(stdout);
+}
+
+bool is_primary_mouse_activation(mmask_t state) {
+  return (state & BUTTON1_RELEASED) != 0 ||
+         (state & BUTTON1_CLICKED) != 0;
+}
 
 void draw_stacked_meter(WINDOW* window, int y, int x, int width, const std::vector<MeterSegment>& segments) {
   static const char* blocks[] = {" ", "▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"};
@@ -402,13 +517,15 @@ void print_help() {
   std::printf(
       "mtop - Apple Silicon terminal monitor\n\n"
       "Usage:\n"
-      "  mtop [--demo] [--theme THEME] [--refresh-ms MS] [--process-limit N] [--config PATH]\n\n"
+      "  mtop [--demo] [--theme THEME] [--refresh-ms MS] [--process-limit N] [--config PATH] [--debug-input] [--debug-log PATH]\n\n"
       "Options:\n"
       "  --demo              Run with synthetic data for UI preview\n"
       "  --theme THEME       Theme name: apple, green, mono\n"
       "  --refresh-ms MS     Refresh interval in milliseconds\n"
       "  --process-limit N   Number of visible process rows\n"
       "  --config PATH       Explicit config file path\n"
+      "  --debug-input       Log key and mouse events to file\n"
+      "  --debug-log PATH    Override input debug log path\n"
       "  --help, -h          Show this help\n"
       "  --version, -v       Show version\n\n"
       "Default config path:\n"
@@ -417,41 +534,18 @@ void print_help() {
 }
 
 void print_version() {
-  std::printf("mtop 1.2.0\n");
+  std::printf("mtop 1.3.0\n");
 }
 
-std::string sort_mode_name(SortMode mode) {
+std::string sort_mode_name(monitor::SortMode mode) {
   switch (mode) {
-    case SortMode::Pid: return "pid";
-    case SortMode::Cpu: return "cpu";
-    case SortMode::Mem: return "mem";
-    case SortMode::Time: return "time";
-    case SortMode::Name: return "name";
+    case monitor::SortMode::Pid: return "pid";
+    case monitor::SortMode::Cpu: return "cpu";
+    case monitor::SortMode::Mem: return "mem";
+    case monitor::SortMode::Time: return "time";
+    case monitor::SortMode::Name: return "name";
   }
   return "cpu";
-}
-
-SortMode cycle_sort(SortMode mode) {
-  switch (mode) {
-    case SortMode::Pid: return SortMode::Cpu;
-    case SortMode::Cpu: return SortMode::Mem;
-    case SortMode::Mem: return SortMode::Time;
-    case SortMode::Time: return SortMode::Name;
-    case SortMode::Name: return SortMode::Pid;
-  }
-  return SortMode::Cpu;
-}
-
-int default_sort_direction(SortMode mode) {
-  switch (mode) {
-    case SortMode::Pid: return 1;
-    case SortMode::Name: return 1;
-    case SortMode::Cpu:
-    case SortMode::Mem:
-    case SortMode::Time:
-      return -1;
-  }
-  return -1;
 }
 
 std::string cpu_topology_summary(const monitor::SystemSnapshot& snapshot) {
@@ -480,6 +574,78 @@ std::string cpu_topology_summary(const monitor::SystemSnapshot& snapshot) {
     result += "+" + parts[i];
   }
   return result;
+}
+
+std::string format_cpu_cluster_summary(const monitor::SystemSnapshot& snapshot, int max_width) {
+  if (snapshot.cpu_clusters.empty()) {
+    return "";
+  }
+
+  std::vector<std::string> detailed_parts;
+  std::vector<std::string> compact_parts;
+  for (const auto& cluster : snapshot.cpu_clusters) {
+    char compact[32];
+    std::snprintf(compact, sizeof(compact), "%c %.0f%%", cluster.label, cluster.utilization_percent);
+    compact_parts.push_back(compact);
+
+    char detailed[64];
+    if (cluster.frequency_available && cluster.frequency_mhz > 0) {
+      std::snprintf(detailed, sizeof(detailed), "%c %.0f%% @ %d", cluster.label, cluster.utilization_percent, cluster.frequency_mhz);
+    } else {
+      std::snprintf(detailed, sizeof(detailed), "%c %.0f%%", cluster.label, cluster.utilization_percent);
+    }
+    detailed_parts.push_back(detailed);
+  }
+
+  auto join_parts = [](const std::vector<std::string>& parts) {
+    std::string result;
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+      if (i > 0) {
+        result += "  ";
+      }
+      result += parts[i];
+    }
+    return result;
+  };
+
+  const std::string detailed = join_parts(detailed_parts);
+  if (static_cast<int>(detailed.size()) <= max_width) {
+    return detailed;
+  }
+  return elide_right(join_parts(compact_parts), max_width);
+}
+
+std::string memory_pressure_badge(monitor::MemoryPressureLevel level) {
+  return monitor::memory_pressure_label(level);
+}
+
+const monitor::ProcessSnapshot* selected_process(const std::vector<ProcessRow>& rows, const UiState& state) {
+  if (!state.selected_pid.has_value()) {
+    return nullptr;
+  }
+  for (const auto& row : rows) {
+    if (row.process && row.process->pid == *state.selected_pid) {
+      return row.process;
+    }
+  }
+  return nullptr;
+}
+
+void trim_history(std::vector<double>& history, std::size_t limit) {
+  if (history.size() > limit) {
+    history.erase(history.begin(), history.begin() + (history.size() - limit));
+  }
+}
+
+void append_io_history(IoHistory& history, const monitor::SystemSnapshot& snapshot, std::size_t limit) {
+  history.disk_read.push_back(static_cast<double>(snapshot.disk_io.read_bytes_per_sec));
+  history.disk_write.push_back(static_cast<double>(snapshot.disk_io.write_bytes_per_sec));
+  history.net_rx.push_back(static_cast<double>(snapshot.network_io.rx_bytes_per_sec));
+  history.net_tx.push_back(static_cast<double>(snapshot.network_io.tx_bytes_per_sec));
+  trim_history(history.disk_read, limit);
+  trim_history(history.disk_write, limit);
+  trim_history(history.net_rx, limit);
+  trim_history(history.net_tx, limit);
 }
 
 double gpu_memory_percent(const monitor::SystemSnapshot& snapshot) {
@@ -524,22 +690,22 @@ bool process_matches_query(const monitor::ProcessSnapshot& process, const std::s
 
 bool process_sort_less(const monitor::ProcessSnapshot* lhs,
                        const monitor::ProcessSnapshot* rhs,
-                       SortMode mode,
+                       monitor::SortMode mode,
                        int direction) {
   switch (mode) {
-    case SortMode::Pid:
+    case monitor::SortMode::Pid:
       if (lhs->pid != rhs->pid) return direction > 0 ? lhs->pid < rhs->pid : lhs->pid > rhs->pid;
       break;
-    case SortMode::Cpu:
+    case monitor::SortMode::Cpu:
       if (lhs->cpu_percent != rhs->cpu_percent) return direction > 0 ? lhs->cpu_percent < rhs->cpu_percent : lhs->cpu_percent > rhs->cpu_percent;
       break;
-    case SortMode::Mem:
+    case monitor::SortMode::Mem:
       if (lhs->memory_percent != rhs->memory_percent) return direction > 0 ? lhs->memory_percent < rhs->memory_percent : lhs->memory_percent > rhs->memory_percent;
       break;
-    case SortMode::Time:
+    case monitor::SortMode::Time:
       if (lhs->total_cpu_time_ns != rhs->total_cpu_time_ns) return direction > 0 ? lhs->total_cpu_time_ns < rhs->total_cpu_time_ns : lhs->total_cpu_time_ns > rhs->total_cpu_time_ns;
       break;
-    case SortMode::Name:
+    case monitor::SortMode::Name:
       if (lhs->command != rhs->command) return direction > 0 ? lhs->command < rhs->command : lhs->command > rhs->command;
       break;
   }
@@ -621,6 +787,28 @@ std::vector<ProcessRow> build_process_rows(const monitor::SystemSnapshot& snapsh
   return rows;
 }
 
+std::vector<ProcessRow> build_gpu_active_rows(const monitor::SystemSnapshot& snapshot, const UiState& state) {
+  UiState filtered_state = state;
+  filtered_state.tree_mode = false;
+  std::vector<const monitor::ProcessSnapshot*> filtered;
+  filtered.reserve(snapshot.processes.size());
+  for (const auto& process : snapshot.processes) {
+    if (process.gpu_active && process_matches_query(process, state.filter)) {
+      filtered.push_back(&process);
+    }
+  }
+  auto less = [&](const monitor::ProcessSnapshot* lhs, const monitor::ProcessSnapshot* rhs) {
+    return process_sort_less(lhs, rhs, filtered_state.sort, filtered_state.sort_direction);
+  };
+  std::sort(filtered.begin(), filtered.end(), less);
+  std::vector<ProcessRow> rows;
+  rows.reserve(filtered.size());
+  for (const auto* process : filtered) {
+    rows.push_back({process, 0, false, false});
+  }
+  return rows;
+}
+
 int selected_process_index(const std::vector<ProcessRow>& rows, const UiState& state) {
   if (!state.selected_pid.has_value()) {
     return -1;
@@ -638,13 +826,20 @@ void set_status(UiState& state, const std::string& message, int duration_ms = 30
   state.status_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(duration_ms);
 }
 
-void set_sort_mode(UiState& state, SortMode mode, bool keep_direction = false) {
+void set_sort_mode(UiState& state, monitor::SortMode mode, bool keep_direction = false) {
   state.sort = mode;
   if (!keep_direction) {
-    state.sort_direction = default_sort_direction(mode);
+    state.sort_direction = monitor::default_sort_direction(mode);
   }
-  state.page = 0;
+  state.table_page = 0;
   state.selected_pid.reset();
+}
+
+void set_view_mode(UiState& state, monitor::ViewMode mode) {
+  state.view_mode = mode;
+  state.table_page = 0;
+  state.selected_pid.reset();
+  state.show_process_detail = false;
 }
 
 void apply_search_request(UiState& state, const std::vector<ProcessRow>& rows) {
@@ -675,18 +870,18 @@ ProcessViewMetrics calculate_process_metrics(const std::vector<ProcessRow>& rows
   metrics.page_rows = std::max(1, window_height - 3);
   metrics.row_count = static_cast<int>(rows.size());
   if (rows.empty()) {
-    state.page = 0;
+    state.table_page = 0;
     state.selected_pid.reset();
     return metrics;
   }
 
   metrics.selected_index = selected_process_index(rows, state);
   metrics.page_count = std::max(1, (metrics.row_count + metrics.page_rows - 1) / metrics.page_rows);
-  state.page = std::clamp(state.page, 0, metrics.page_count - 1);
+  state.table_page = std::clamp(state.table_page, 0, metrics.page_count - 1);
   if (metrics.selected_index >= 0 &&
-      (metrics.selected_index < state.page * metrics.page_rows ||
-       metrics.selected_index >= (state.page + 1) * metrics.page_rows)) {
-    state.page = metrics.selected_index / metrics.page_rows;
+      (metrics.selected_index < state.table_page * metrics.page_rows ||
+       metrics.selected_index >= (state.table_page + 1) * metrics.page_rows)) {
+    state.table_page = metrics.selected_index / metrics.page_rows;
   }
   return metrics;
 }
@@ -712,6 +907,11 @@ void apply_pid_search(UiState& state, const std::vector<ProcessRow>& rows, int c
     state.pid_search.clear();
   }
   state.pid_search.push_back(static_cast<char>(ch));
+  if (state.pid_search.size() > 8) {
+    state.pid_search.clear();
+    set_status(state, "Cleared stale numeric input", 1200);
+    return;
+  }
   state.pid_search_deadline = now + std::chrono::milliseconds(1500);
 
   for (const auto& row : rows) {
@@ -789,7 +989,8 @@ void nvtop_line_plot_port(WINDOW* win,
                           const double* data,
                           unsigned num_lines,
                           bool legend_left,
-                          char legend[4][32]) {
+                          char legend[4][32],
+                          const short* line_colors = nullptr) {
   if (num_data == 0 || num_lines == 0) {
     return;
   }
@@ -802,7 +1003,8 @@ void nvtop_line_plot_port(WINDOW* win,
     return;
   }
   const double increment = 100.0 / static_cast<double>(rows);
-  static const short plot_line_colors[4] = {13, 14, 13, 14};
+  static const short default_plot_line_colors[4] = {13, 14, 13, 14};
+  const short* plot_line_colors = line_colors ? line_colors : default_plot_line_colors;
 
   unsigned lvl_before[4] = {0, 0, 0, 0};
   for (unsigned line = 0; line < num_lines; ++line) {
@@ -999,21 +1201,33 @@ void draw_gpu(WINDOW* window,
   werase(plot_window);
 
   char legend[4][32] = {};
+  static const short gpu_plot_colors[4] = {13, 14, 11, 14};
+  const std::string mem_compact = snapshot.gpu_memory_total_bytes > 0
+                                      ? compact_bytes_with_decimal(snapshot.gpu_memory_used_bytes) + "/" +
+                                            compact_bytes_with_decimal(snapshot.gpu_memory_total_bytes)
+                                      : "N/A";
+  const int gpu_active_count = static_cast<int>(std::count_if(
+      snapshot.processes.begin(), snapshot.processes.end(),
+      [](const monitor::ProcessSnapshot& process) { return process.gpu_active; }));
   if (snapshot.gpu_frequency_mhz > 0) {
-    std::snprintf(legend[0], sizeof(legend[0]), "  GPU %d%% @ %d MHz",
+    std::snprintf(legend[0], sizeof(legend[0]), "  GPU %d%%@%d M%s",
                   static_cast<int>(std::round(snapshot.gpu_utilization_percent)),
-                  snapshot.gpu_frequency_mhz);
+                  snapshot.gpu_frequency_mhz,
+                  mem_compact.c_str());
   } else {
-    std::snprintf(legend[0], sizeof(legend[0]), "  GPU %d%%",
-                  static_cast<int>(std::round(snapshot.gpu_utilization_percent)));
+    std::snprintf(legend[0], sizeof(legend[0]), "  GPU %d%% M%s",
+                  static_cast<int>(std::round(snapshot.gpu_utilization_percent)),
+                  mem_compact.c_str());
   }
   if (snapshot.gpu_power_watts > 0.0) {
-    std::snprintf(legend[1], sizeof(legend[1]), "  SOC %.1fW / GPU %.1fW",
-                  snapshot.system_power_watts, snapshot.gpu_power_watts);
+    std::snprintf(legend[1], sizeof(legend[1]), "  SOC %.1fW GPU %.1fW A%d",
+                  snapshot.system_power_watts, snapshot.gpu_power_watts, gpu_active_count);
+  } else if (gpu_active_count > 0) {
+    std::snprintf(legend[1], sizeof(legend[1]), "  SOC %.1fW A%d", snapshot.system_power_watts, gpu_active_count);
   } else {
     std::snprintf(legend[1], sizeof(legend[1]), "  SOC %.1fW", snapshot.system_power_watts);
   }
-  nvtop_line_plot_port(plot_window, plot_data.size(), plot_data.data(), 2, true, legend);
+  nvtop_line_plot_port(plot_window, plot_data.size(), plot_data.data(), 2, true, legend, gpu_plot_colors);
   wnoutrefresh(plot_window);
   delwin(plot_window);
 
@@ -1049,20 +1263,25 @@ void draw_cpu(WINDOW* window, const monitor::SystemSnapshot& snapshot) {
   int max_y = 0;
   int max_x = 0;
   getmaxyx(window, max_y, max_x);
+  const std::string cluster_summary = format_cpu_cluster_summary(snapshot, std::max(0, max_x - 4));
+  const int header_row = cluster_summary.empty() ? 1 : 2;
+  if (!cluster_summary.empty() && max_y > 2) {
+    mvwprintw(window, 1, 2, "%s", cluster_summary.c_str());
+  }
   const int inner_width = std::max(1, max_x - 2);
   const int column_width = std::max(18, inner_width / static_cast<int>(columns.size()));
   for (int column_index = 0; column_index < static_cast<int>(columns.size()); ++column_index) {
     const int x = 1 + column_index * column_width;
     const int usable_width = std::min(column_width - 1, max_x - x - 1);
     if (usable_width < 12) continue;
-    mvwprintw(window, 1, x + 1, "%s", columns[column_index].first);
+    mvwprintw(window, header_row, x + 1, "%s", columns[column_index].first);
     const int meter_left = x + 12;
     const int meter_width = std::max(4, usable_width - 13);
     const auto& cores = *columns[column_index].second;
-    for (int row = 0; row < static_cast<int>(cores.size()) && row + 2 < max_y - 1; ++row) {
+    for (int row = 0; row < static_cast<int>(cores.size()) && row + header_row + 1 < max_y - 1; ++row) {
       const auto& core = *cores[row];
-      mvwprintw(window, row + 2, x + 1, "%3s %5.1f%%", core.label.c_str(), core.utilization_percent);
-      draw_meter(window, row + 2, meter_left, meter_width, core.utilization_percent, 2);
+      mvwprintw(window, row + header_row + 1, x + 1, "%3s %5.1f%%", core.label.c_str(), core.utilization_percent);
+      draw_meter(window, row + header_row + 1, meter_left, meter_width, core.utilization_percent, 2);
     }
   }
 }
@@ -1071,16 +1290,18 @@ void draw_memory(WINDOW* window, const monitor::SystemSnapshot& snapshot, const 
   werase(window);
   wattron(window, COLOR_PAIR(1));
   box(window, 0, 0);
-  if (snapshot.swap_total_bytes > 0 &&
-      static_cast<double>(snapshot.swap_used_bytes) / snapshot.swap_total_bytes > 0.1) {
-    mvwprintw(window, 0, 2, " Memory [WARN] ");
+  const std::string pressure = memory_pressure_badge(snapshot.memory_pressure);
+  if (snapshot.memory_pressure == monitor::MemoryPressureLevel::Warn ||
+      snapshot.memory_pressure == monitor::MemoryPressureLevel::Critical) {
+    mvwprintw(window, 0, 2, " Memory [%s] ", pressure.c_str());
   } else {
     mvwprintw(window, 0, 2, " Memory ");
   }
   wattroff(window, COLOR_PAIR(1));
 
+  int max_y = 0;
   int max_x = 0;
-  getmaxyx(window, std::ignore, max_x);
+  getmaxyx(window, max_y, max_x);
   const double swap_percent = snapshot.swap_total_bytes > 0
                                   ? static_cast<double>(snapshot.swap_used_bytes) * 100.0 /
                                         static_cast<double>(snapshot.swap_total_bytes)
@@ -1119,6 +1340,9 @@ void draw_memory(WINDOW* window, const monitor::SystemSnapshot& snapshot, const 
   const int meter_left = 8;
   const int meter_width = std::max(8, max_x - meter_left - usage_width - 4);
   const int usage_col = std::min(max_x - usage_width - 2, meter_left + meter_width + 2);
+  const std::uint64_t reclaimable_bytes = snapshot.memory_inactive_bytes +
+                                          snapshot.memory_speculative_bytes +
+                                          snapshot.memory_purgeable_bytes;
 
   mvwprintw(window, 1, 2, "Mem");
   mvwprintw(window, 2, 2, "Swp");
@@ -1126,6 +1350,13 @@ void draw_memory(WINDOW* window, const monitor::SystemSnapshot& snapshot, const 
   draw_meter(window, 2, meter_left, meter_width, swap_percent, 3);
   mvwprintw(window, 1, usage_col, "%s", mem_summary);
   mvwprintw(window, 2, usage_col, "%s", swap_summary);
+  if (max_y >= 5) {
+    std::string pressure_line = std::string("Pressure: ") + memory_pressure_badge(snapshot.memory_pressure) +
+                                " | Compr " + compact_bytes_with_decimal(snapshot.memory_compressed_bytes) +
+                                " | Recl " + compact_bytes_with_decimal(reclaimable_bytes) +
+                                " | Swap " + compact_bytes_with_decimal(snapshot.swap_used_bytes);
+    mvwprintw(window, 3, 2, "%s", elide_right(pressure_line, std::max(0, max_x - 4)).c_str());
+  }
 }
 
 void draw_processes(WINDOW* window,
@@ -1169,7 +1400,7 @@ void draw_processes(WINDOW* window,
     return;
   }
 
-  const int start = state.page * metrics.page_rows;
+  const int start = state.table_page * metrics.page_rows;
   const int end = std::min(start + metrics.page_rows, static_cast<int>(rows.size()));
   for (int index = start; index < end; ++index) {
     const auto& row = rows[index];
@@ -1229,6 +1460,159 @@ void draw_processes(WINDOW* window,
   }
 }
 
+void draw_system_io_view(WINDOW* window,
+                         const monitor::SystemSnapshot& snapshot,
+                         const IoHistory& history,
+                         int refresh_ms) {
+  werase(window);
+  wattron(window, COLOR_PAIR(1));
+  box(window, 0, 0);
+  mvwprintw(window, 0, 2, " System I/O ");
+  wattroff(window, COLOR_PAIR(1));
+
+  const int max_y = getmaxy(window);
+  const int max_x = getmaxx(window);
+  const bool compact = max_x < 56;
+  mvwprintw(window, 1, 2, "%s",
+            elide_right(compact ? "Host throughput only" : "Host throughput, not per-process I/O",
+                        std::max(0, max_x - 4)).c_str());
+
+  const std::string disk_summary = monitor::format_labeled_throughput_summary(
+      "Disk", "R", snapshot.disk_io.read_bytes_per_sec, "W", snapshot.disk_io.write_bytes_per_sec,
+      snapshot.disk_io.available, compact);
+  const std::string net_summary = monitor::format_labeled_throughput_summary(
+      "Net", "RX", snapshot.network_io.rx_bytes_per_sec, "TX", snapshot.network_io.tx_bytes_per_sec,
+      snapshot.network_io.available, compact);
+  mvwprintw(window, 2, 2, "%s", elide_right(disk_summary, std::max(0, max_x - 4)).c_str());
+  mvwprintw(window, 3, 2, "%s", elide_right(net_summary, std::max(0, max_x - 4)).c_str());
+
+  if (max_y < 10 || max_x < 32) {
+    return;
+  }
+
+  const int plot_rows = std::max(3, (max_y - 8) / 2);
+  const int plot_cols = std::max(8, max_x - 6);
+  WINDOW* disk_plot = derwin(window, plot_rows, plot_cols, 5, 3);
+  WINDOW* net_plot = derwin(window, plot_rows, plot_cols, 5 + plot_rows, 3);
+  if (!disk_plot || !net_plot) {
+    if (disk_plot) delwin(disk_plot);
+    if (net_plot) delwin(net_plot);
+    return;
+  }
+  werase(disk_plot);
+  werase(net_plot);
+
+  std::vector<double> plot_data;
+  int visible_seconds = 0;
+  int plot_cols_used = 0;
+  char legend[4][32] = {};
+
+  populate_nvtop_plot_data(history.disk_read, history.disk_write, refresh_ms, plot_cols, plot_data, visible_seconds, plot_cols_used);
+  std::snprintf(legend[0], sizeof(legend[0]), "  Disk read");
+  std::snprintf(legend[1], sizeof(legend[1]), "  Disk write");
+  nvtop_line_plot_port(disk_plot, plot_data.size(), plot_data.data(), 2, true, legend);
+  wnoutrefresh(disk_plot);
+
+  populate_nvtop_plot_data(history.net_rx, history.net_tx, refresh_ms, plot_cols, plot_data, visible_seconds, plot_cols_used);
+  std::snprintf(legend[0], sizeof(legend[0]), "  Net rx");
+  std::snprintf(legend[1], sizeof(legend[1]), "  Net tx");
+  nvtop_line_plot_port(net_plot, plot_data.size(), plot_data.data(), 2, true, legend);
+  wnoutrefresh(net_plot);
+  delwin(disk_plot);
+  delwin(net_plot);
+}
+
+void draw_gpu_active_view(WINDOW* window,
+                          const std::vector<ProcessRow>& rows,
+                          UiState& state,
+                          const ProcessViewMetrics& metrics) {
+  werase(window);
+  wattron(window, COLOR_PAIR(1));
+  box(window, 0, 0);
+  mvwprintw(window, 0, 2, " GPU Active ");
+  wattroff(window, COLOR_PAIR(1));
+  const int max_x = getmaxx(window);
+  const bool compact = max_x < 72;
+  mvwprintw(window, 1, 2, "%s",
+            elide_right(compact ? "Filtered main process view" : "Focused process view from main process data source",
+                        std::max(0, max_x - 4)).c_str());
+
+  if (rows.empty()) {
+    mvwprintw(window, 3, 2, "No GPU-active processes");
+    return;
+  }
+
+  const int start = state.table_page * metrics.page_rows;
+  const int end = std::min(start + metrics.page_rows, static_cast<int>(rows.size()));
+  mvwprintw(window, 2, 2, "%s",
+            compact ? "PID   CPU% GPU PWR Command"
+                    : "PID   USER       CPU%   GPU  MIX          PWR   Command");
+  for (int index = start; index < end; ++index) {
+    const auto& process = *rows[index].process;
+    const int screen_row = 3 + (index - start);
+    const bool selected = index == metrics.selected_index;
+    mvwhline(window, screen_row, 1, ' ', max_x - 2);
+    if (selected) {
+      if (has_colors()) wattron(window, COLOR_PAIR(15));
+      else wattron(window, A_REVERSE);
+    }
+    if (compact) {
+      mvwprintw(window, screen_row, 2, "%5d %5.1f %3s %5.5s %s",
+                process.pid,
+                process.cpu_percent,
+                process.gpu_active ? "Y" : "N",
+                process.power.c_str(),
+                elide_right(process.command, std::max(0, max_x - 26)).c_str());
+    } else {
+      mvwprintw(window, screen_row, 2, "%5d %-10.10s %5.1f %4s %-12.12s %5.5s %s",
+                process.pid,
+                process.user.c_str(),
+                process.cpu_percent,
+                process.gpu_active ? "Y" : "N",
+                process.core_mix.c_str(),
+                process.power.c_str(),
+                elide_right(process.command, std::max(0, max_x - 47)).c_str());
+    }
+    if (selected) {
+      if (has_colors()) wattroff(window, COLOR_PAIR(15));
+      else wattroff(window, A_REVERSE);
+    }
+  }
+}
+
+void draw_process_detail_popup(const WindowLayout& layout,
+                               const monitor::ProcessSnapshot& process) {
+  const int height = 13;
+  const int width = std::min(88, layout.cols - 4);
+  const int y = std::max(1, (layout.rows - height) / 2);
+  const int x = std::max(2, (layout.cols - width) / 2);
+  WINDOW* popup = newwin(height, width, y, x);
+  box(popup, 0, 0);
+  if (has_colors()) wattron(popup, COLOR_PAIR(4));
+  mvwhline(popup, 0, 1, ' ', width - 2);
+  mvwprintw(popup, 0, 2, " Process Detail ");
+  if (has_colors()) wattroff(popup, COLOR_PAIR(4));
+  mvwhline(popup, 1, 1, ACS_HLINE, width - 2);
+  mvwprintw(popup, 3, 3, "Command : %s", elide_right(process.command, std::max(0, width - 14)).c_str());
+  mvwprintw(popup, 4, 3, "PID/PPID: %d / %d", process.pid, process.parent_pid);
+  mvwprintw(popup, 5, 3, "User    : %s", process.user.c_str());
+  mvwprintw(popup, 6, 3, "Runtime : %s", format_cpu_time(process.total_cpu_time_ns).c_str());
+  mvwprintw(popup, 7, 3, "%s",
+            elide_right((std::string("Memory  : RES ") + compact_bytes_with_decimal(process.resident_bytes) +
+                         "  VIRT " + compact_bytes_with_decimal(process.virtual_bytes)),
+                        std::max(0, width - 6)).c_str());
+  mvwprintw(popup, 8, 3, "%s",
+            elide_right((std::string("Signals : MIX ") + process.core_mix +
+                         "  IO " + process.io +
+                         "  PWR " + process.power),
+                        std::max(0, width - 6)).c_str());
+  mvwprintw(popup, 9, 3, "GPU     : %s", process.gpu_active ? "active" : "n/a");
+  mvwhline(popup, height - 2, 1, ACS_HLINE, width - 2);
+  mvwprintw(popup, height - 1, 3, "Enter / Esc / d to close");
+  wnoutrefresh(popup);
+  delwin(popup);
+}
+
 void draw_key_label(WINDOW* window, int row, int& col, const char* key, const char* label, ButtonBounds* bounds, int event) {
   if (col >= getmaxx(window) - 4) {
     return;
@@ -1257,24 +1641,31 @@ void draw_key_label(WINDOW* window, int row, int& col, const char* key, const ch
 
 void draw_footer(WINDOW* window, UiState& state) {
   werase(window);
+  const int width = getmaxx(window);
   if (state.prompt_mode == PromptMode::Search) {
-    mvwprintw(window, 0, 0, "search> %s", state.prompt_buffer.c_str());
+    mvwprintw(window, 0, 0, "%s", elide_right("search> " + state.prompt_buffer, std::max(0, width - 1)).c_str());
   } else if (state.prompt_mode == PromptMode::Filter) {
-    mvwprintw(window, 0, 0, "filter> %s", state.prompt_buffer.c_str());
+    mvwprintw(window, 0, 0, "%s", elide_right("filter> " + state.prompt_buffer, std::max(0, width - 1)).c_str());
   } else if (state.prompt_mode == PromptMode::Sort) {
-    mvwprintw(window, 0, 0, "sort> [N]PID [P]CPU [M]EM [T]IME [A]NAME [I]nvert");
+    mvwprintw(window, 0, 0, "%s",
+              elide_right("sort> [N]PID [P]CPU [M]EM [T]IME [A]NAME [I]nvert", std::max(0, width - 1)).c_str());
   } else if (state.prompt_mode == PromptMode::Signal) {
-    mvwprintw(window, 0, 0, "signal> %s", state.prompt_buffer.c_str());
+    mvwprintw(window, 0, 0, "%s", elide_right("signal> " + state.prompt_buffer, std::max(0, width - 1)).c_str());
   } else if (!state.status_message.empty() &&
              std::chrono::steady_clock::now() < state.status_deadline) {
-    mvwprintw(window, 0, 0, "%s", state.status_message.c_str());
+    mvwprintw(window, 0, 0, "%s", elide_right(state.status_message, std::max(0, width - 1)).c_str());
   } else {
-    mvwprintw(window, 0, 0, "sort=%s%s | tree=%s | filter=%s | search=%s",
-              sort_mode_name(state.sort).c_str(),
-              state.sort_direction > 0 ? " asc" : " desc",
-              state.tree_mode ? "on" : "off",
-              state.filter.empty() ? "-" : state.filter.c_str(),
-              state.search.empty() ? "-" : state.search.c_str());
+    const bool compact = width < 72;
+    const std::string line = compact
+                                 ? std::string("view=") + monitor::view_mode_label(state.view_mode) +
+                                       " | sort=" + sort_mode_name(state.sort)
+                                 : std::string("view=") + monitor::view_mode_label(state.view_mode) +
+                                       " | sort=" + sort_mode_name(state.sort) +
+                                       (state.sort_direction > 0 ? " asc" : " desc") +
+                                       " | tree=" + (state.tree_mode ? "on" : "off") +
+                                       " | filter=" + (state.filter.empty() ? "-" : state.filter) +
+                                       " | search=" + (state.search.empty() ? "-" : state.search);
+    mvwprintw(window, 0, 0, "%s", elide_right(line, std::max(0, width - 1)).c_str());
   }
 
   int col = 0;
@@ -1284,14 +1675,14 @@ void draw_footer(WINDOW* window, UiState& state) {
   draw_key_label(window, 1, col, "F4", "Filter", &state.footer_buttons[3], KEY_F(4));
   draw_key_label(window, 1, col, "F5", "Tree", &state.footer_buttons[4], KEY_F(5));
   draw_key_label(window, 1, col, "F6", "SortBy", &state.footer_buttons[5], KEY_F(6));
-  draw_key_label(window, 1, col, "F7", "Nice-", &state.footer_buttons[6], KEY_F(7));
-  draw_key_label(window, 1, col, "F8", "Nice+", &state.footer_buttons[7], KEY_F(8));
+  draw_key_label(window, 1, col, "F7", "View-", &state.footer_buttons[6], KEY_F(7));
+  draw_key_label(window, 1, col, "F8", "View+", &state.footer_buttons[7], KEY_F(8));
   draw_key_label(window, 1, col, "F9", "Kill", &state.footer_buttons[8], KEY_F(9));
   draw_key_label(window, 1, col, "F10", "Quit", &state.footer_buttons[9], KEY_F(10));
 }
 
 void draw_help_popup(const WindowLayout& layout) {
-  const int height = 13;
+  const int height = 16;
   const int width = std::min(78, layout.cols - 4);
   const int y = std::max(1, (layout.rows - height) / 2);
   const int x = std::max(2, (layout.cols - width) / 2);
@@ -1308,8 +1699,10 @@ void draw_help_popup(const WindowLayout& layout) {
   mvwprintw(popup, 6, 3, "F5 or t: tree view");
   mvwprintw(popup, 7, 3, "F6 or > or .: sort menu");
   mvwprintw(popup, 8, 3, "N/P/M/T/A/I: PID, CPU, MEM, TIME, NAME, invert");
-  mvwprintw(popup, 9, 3, "F7/F8 or ]/[: renice  F9 or k: send signal");
-  mvwprintw(popup, 10, 3, "Mouse: click headers to sort, click rows to select");
+  mvwprintw(popup, 9, 3, "F7/F8 or {/}: switch view  Tab/Shift-Tab also works");
+  mvwprintw(popup, 10, 3, "Views: Overview / System I/O / GPU Active");
+  mvwprintw(popup, 11, 3, "[/]: renice  F9 or k: send signal  d: process detail");
+  mvwprintw(popup, 12, 3, "Mouse: click headers to sort, click rows to select");
   mvwhline(popup, height - 2, 1, ACS_HLINE, width - 2);
   mvwprintw(popup, height - 1, 3, "Esc / Enter / F1 to close");
   wnoutrefresh(popup);
@@ -1404,9 +1797,20 @@ int synthesize_mouse_event(const WindowLayout& layout,
   int process_y = 0;
   int process_x = 0;
   getbegyx(layout.processes, process_y, process_x);
-  if (event.y == process_y + 1) {
+  if (state.view_mode == monitor::ViewMode::Overview &&
+      event.y >= process_y && event.y <= process_y + 1) {
     const int local_x = event.x - process_x;
+    input_debug_log("header candidate local_x=%d global=(%d,%d)", local_x, event.x, event.y);
+    if (const auto column_index = process_column_index_from_header_x(local_x)) {
+      const ProcessColumn& def = kProcessColumns[*column_index];
+      input_debug_log("header column=%s sortable=%d", def.title, def.sortable ? 1 : 0);
+      if (!def.sortable) {
+        set_status(state, std::string("Header hit: ") + def.title + " (not sortable)", 1500);
+        return ERR;
+      }
+    }
     if (const auto sort = process_sort_from_header_x(local_x)) {
+      input_debug_log("header sort hit mode=%s", sort_mode_name(*sort).c_str());
       if (state.sort == *sort) {
         state.sort_direction *= -1;
       } else {
@@ -1415,12 +1819,14 @@ int synthesize_mouse_event(const WindowLayout& layout,
       set_status(state, "Sort: " + sort_mode_name(state.sort) + (state.sort_direction > 0 ? " asc" : " desc"));
       return ERR;
     }
+    input_debug_log("header miss local_x=%d", local_x);
+    set_status(state, "Header miss x=" + std::to_string(local_x), 1200);
   }
 
   const int row_start = process_y + 2;
   const int row_end = row_start + metrics.page_rows - 1;
   if (event.y >= row_start && event.y <= row_end) {
-    const int index = state.page * metrics.page_rows + (event.y - row_start);
+    const int index = state.table_page * metrics.page_rows + (event.y - row_start);
     if (index >= 0 && index < static_cast<int>(rows.size())) {
       state.selected_pid = rows[index].process->pid;
       return ERR;
@@ -1447,9 +1853,24 @@ bool handle_input(int ch,
                   UiState& state,
                   const std::vector<ProcessRow>& rows,
                   const ProcessViewMetrics& metrics) {
+  auto cycle_view = [&](int delta) {
+    set_view_mode(state, monitor::cycle_view_mode(state.view_mode, delta));
+    set_status(state, std::string("View: ") + monitor::view_mode_label(state.view_mode));
+    return true;
+  };
+  const bool process_view_active = state.view_mode == monitor::ViewMode::Overview ||
+                                   state.view_mode == monitor::ViewMode::GpuActive;
+
   if (state.show_help) {
     if (ch == 27 || ch == '\n' || ch == KEY_ENTER || ch == KEY_F(1)) {
       state.show_help = false;
+    }
+    return true;
+  }
+
+  if (state.show_process_detail) {
+    if (ch == 27 || ch == '\n' || ch == KEY_ENTER || ch == 'd' || ch == 'D') {
+      state.show_process_detail = false;
     }
     return true;
   }
@@ -1498,7 +1919,7 @@ bool handle_input(int ch,
     if (ch == 27) {
       if (state.prompt_mode == PromptMode::Filter) {
         state.filter.clear();
-        state.page = 0;
+        state.table_page = 0;
         state.selected_pid.reset();
       } else if (state.prompt_mode == PromptMode::Search) {
         state.search.clear();
@@ -1513,7 +1934,7 @@ bool handle_input(int ch,
         state.search_pending = true;
       } else if (state.prompt_mode == PromptMode::Filter) {
         state.filter = state.prompt_buffer;
-        state.page = 0;
+        state.table_page = 0;
         state.selected_pid.reset();
       } else if (state.prompt_mode == PromptMode::Signal) {
         const int signal_number = state.prompt_buffer.empty() ? SIGTERM : std::atoi(state.prompt_buffer.c_str());
@@ -1537,19 +1958,19 @@ bool handle_input(int ch,
     if (state.prompt_mode == PromptMode::Sort) {
       switch (std::tolower(ch)) {
         case 'n':
-          set_sort_mode(state, SortMode::Pid);
+          set_sort_mode(state, monitor::SortMode::Pid);
           break;
         case 'p':
-          set_sort_mode(state, SortMode::Cpu);
+          set_sort_mode(state, monitor::SortMode::Cpu);
           break;
         case 'm':
-          set_sort_mode(state, SortMode::Mem);
+          set_sort_mode(state, monitor::SortMode::Mem);
           break;
         case 't':
-          set_sort_mode(state, SortMode::Time);
+          set_sort_mode(state, monitor::SortMode::Time);
           break;
         case 'a':
-          set_sort_mode(state, SortMode::Name);
+          set_sort_mode(state, monitor::SortMode::Name);
           break;
         case 'i':
           state.sort_direction *= -1;
@@ -1575,44 +1996,54 @@ bool handle_input(int ch,
     case KEY_F(10):
       return false;
     case KEY_UP:
+      if (!process_view_active) return true;
       move_selection(state, rows, -1);
       return true;
     case KEY_DOWN:
+      if (!process_view_active) return true;
       move_selection(state, rows, 1);
       return true;
     case KEY_PPAGE:
     case KEY_LEFT:
+      if (!process_view_active) {
+        return cycle_view(-1);
+      }
       move_selection(state, rows, -metrics.page_rows);
       return true;
     case KEY_NPAGE:
     case KEY_RIGHT:
+      if (!process_view_active) {
+        return cycle_view(1);
+      }
       move_selection(state, rows, metrics.page_rows);
       return true;
     case KEY_HOME:
+      if (!process_view_active) return true;
       if (!rows.empty()) state.selected_pid = rows.front().process->pid;
       return true;
     case KEY_END:
+      if (!process_view_active) return true;
       if (!rows.empty()) state.selected_pid = rows.back().process->pid;
       return true;
     case 'n':
     case 'N':
-      set_sort_mode(state, SortMode::Pid);
+      set_sort_mode(state, monitor::SortMode::Pid);
       return true;
     case 'c':
     case 'p':
     case 'P':
-      set_sort_mode(state, SortMode::Cpu);
+      set_sort_mode(state, monitor::SortMode::Cpu);
       return true;
     case 'm':
     case 'M':
-      set_sort_mode(state, SortMode::Mem);
+      set_sort_mode(state, monitor::SortMode::Mem);
       return true;
     case 'T':
-      set_sort_mode(state, SortMode::Time);
+      set_sort_mode(state, monitor::SortMode::Time);
       return true;
     case 'a':
     case 'A':
-      set_sort_mode(state, SortMode::Name);
+      set_sort_mode(state, monitor::SortMode::Name);
       return true;
     case 'i':
     case 'I':
@@ -1620,7 +2051,12 @@ bool handle_input(int ch,
       set_status(state, "Sort: " + sort_mode_name(state.sort) + (state.sort_direction > 0 ? " asc" : " desc"));
       return true;
     case '\t':
-      set_sort_mode(state, cycle_sort(state.sort));
+      return cycle_view(1);
+    case KEY_BTAB:
+      return cycle_view(-1);
+    case 's':
+    case 'S':
+      set_sort_mode(state, monitor::cycle_sort(state.sort));
       set_status(state, "Sort: " + sort_mode_name(state.sort) + (state.sort_direction > 0 ? " asc" : " desc"));
       return true;
     case '/':
@@ -1642,14 +2078,23 @@ bool handle_input(int ch,
       return true;
     case KEY_F(5):
     case 't':
+      if (state.view_mode != monitor::ViewMode::Overview) {
+        return true;
+      }
       state.tree_mode = !state.tree_mode;
-      state.page = 0;
+      state.table_page = 0;
       set_status(state, std::string("Tree mode ") + (state.tree_mode ? "enabled" : "disabled"));
       return true;
     case KEY_F(7):
+      return cycle_view(-1);
+    case '{':
+      return cycle_view(-1);
     case ']':
       return renice_selected_process(state, -1);
     case KEY_F(8):
+      return cycle_view(1);
+    case '}':
+      return cycle_view(1);
     case '[':
       return renice_selected_process(state, 1);
     case KEY_F(9):
@@ -1663,17 +2108,34 @@ bool handle_input(int ch,
     case KEY_F(2):
       state.show_setup = true;
       return true;
+    case 'd':
+    case 'D':
+      if (state.selected_pid.has_value()) {
+        state.show_process_detail = true;
+      } else {
+        set_status(state, "No selected process");
+      }
+      return true;
     case '+':
+      if (state.view_mode != monitor::ViewMode::Overview) {
+        return true;
+      }
       state.tree_mode = true;
       expand_selected(state);
       set_status(state, "Expanded selected tree node");
       return true;
     case '-':
+      if (state.view_mode != monitor::ViewMode::Overview) {
+        return true;
+      }
       state.tree_mode = true;
       collapse_selected(state, rows);
       set_status(state, "Collapsed selected tree node");
       return true;
     case '*':
+      if (state.view_mode != monitor::ViewMode::Overview) {
+        return true;
+      }
       state.tree_mode = true;
       toggle_all_tree_nodes(state, rows);
       set_status(state, state.collapsed_pids.empty() ? "Expanded all tree nodes" : "Collapsed all tree nodes");
@@ -1681,12 +2143,12 @@ bool handle_input(int ch,
     case 'x':
       state.filter.clear();
       state.search.clear();
-      state.page = 0;
+      state.table_page = 0;
       state.selected_pid.reset();
       set_status(state, "Cleared filter and search");
       return true;
     default:
-      if (std::isdigit(static_cast<unsigned char>(ch))) {
+      if (process_view_active && std::isdigit(static_cast<unsigned char>(ch))) {
         apply_pid_search(state, rows, ch);
         return true;
       }
@@ -1699,16 +2161,40 @@ monitor::SystemSnapshot apply_demo_snapshot(monitor::SystemSnapshot snapshot, in
   snapshot.thermal = "Nominal";
   snapshot.ane = "N/A without root";
   snapshot.gpu_utilization_percent = 15.0 + 10.0 * std::sin(static_cast<double>(tick) / 5.0);
-  snapshot.gpu_summary = std::to_string(static_cast<int>(snapshot.gpu_utilization_percent)) + "% total util";
+  snapshot.gpu_summary = std::to_string(static_cast<int>(snapshot.gpu_utilization_percent)) + "% util";
   snapshot.system_power_watts = 18.0 + 6.0 * std::sin(static_cast<double>(tick) / 6.0);
+  snapshot.gpu_power_watts = 2.5 + 1.2 * std::max(0.0, std::sin(static_cast<double>(tick) / 4.0));
+  snapshot.gpu_frequency_mhz = 420 + static_cast<int>(80.0 * std::max(0.0, std::sin(static_cast<double>(tick) / 5.0)));
   snapshot.gpu_memory_total_bytes = snapshot.memory_total_bytes > 0 ? snapshot.memory_total_bytes : (128ULL << 30);
   snapshot.gpu_memory_used_bytes = static_cast<std::uint64_t>(
       (5.0 + 2.0 * std::max(0.0, std::sin(static_cast<double>(tick) / 6.0))) * 1024.0 * 1024.0 * 1024.0);
+  snapshot.disk_io.available = true;
+  snapshot.disk_io.read_bytes_per_sec = static_cast<std::uint64_t>(2.5 * 1024.0 * 1024.0 * std::max(0.0, 1.0 + std::sin(static_cast<double>(tick) / 7.0)));
+  snapshot.disk_io.write_bytes_per_sec = static_cast<std::uint64_t>(1.2 * 1024.0 * 1024.0 * std::max(0.0, 1.0 + std::cos(static_cast<double>(tick) / 8.0)));
+  snapshot.network_io.available = true;
+  snapshot.network_io.rx_bytes_per_sec = static_cast<std::uint64_t>(6.0 * 1024.0 * 1024.0 * std::max(0.0, 0.5 + std::sin(static_cast<double>(tick) / 9.0)));
+  snapshot.network_io.tx_bytes_per_sec = static_cast<std::uint64_t>(1.5 * 1024.0 * 1024.0 * std::max(0.0, 0.5 + std::cos(static_cast<double>(tick) / 10.0)));
   for (std::size_t i = 0; i < snapshot.cpu_cores.size(); ++i) {
     const double base = 10.0 + (i % 6) * 8.0;
     snapshot.cpu_cores[i].utilization_percent =
         std::clamp(base + 20.0 * std::sin((tick + static_cast<int>(i)) / 3.0), 0.0, 100.0);
   }
+  for (auto& cluster : snapshot.cpu_clusters) {
+    double total = 0.0;
+    int count = 0;
+    for (const auto& core : snapshot.cpu_cores) {
+      if (core.cluster_type != cluster.name) {
+        continue;
+      }
+      total += core.utilization_percent;
+      ++count;
+    }
+    cluster.core_count = count;
+    cluster.utilization_percent = count > 0 ? total / static_cast<double>(count) : 0.0;
+    cluster.frequency_available = true;
+    cluster.frequency_mhz = cluster.label == 'S' ? 4200 : cluster.label == 'P' ? 2400 : 1450;
+  }
+  snapshot.memory_pressure = monitor::derive_memory_pressure(snapshot);
 
   if (snapshot.processes.empty()) {
     monitor::ProcessSnapshot window_server;
@@ -1773,7 +2259,7 @@ WindowLayout create_windows(int rows, int cols) {
 
   const int info_height = 1;
   const int footer_height = 2;
-  const int memory_height = 4;
+  const int memory_height = 5;
   const int remaining = std::max(16, rows - info_height - memory_height - footer_height);
   const int preferred_top_height = 18;
   const int top_height = std::max(10, std::min(preferred_top_height, remaining - 6));
@@ -1825,21 +2311,38 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  if (options.debug_input) {
+    const std::string path = options.debug_log_path.empty()
+                                 ? "/Users/xiuranli/code/mtop/build/mtop-input-debug.log"
+                                 : options.debug_log_path;
+    set_input_debug_log_path(path);
+  }
+
+  clear_terminal_mouse_reporting();
   std::setlocale(LC_ALL, "");
   initscr();
   cbreak();
   noecho();
+  nonl();
+  intrflush(stdscr, FALSE);
   keypad(stdscr, TRUE);
+  meta(stdscr, TRUE);
   nodelay(stdscr, TRUE);
-  mousemask(BUTTON1_RELEASED, nullptr);
+  mousemask(0, nullptr);
+  flushinp();
+  enable_terminal_mouse_reporting();
+  mmask_t active_mask = mousemask(BUTTON1_RELEASED, nullptr);
   mouseinterval(0);
+  monitor::configure_defined_keys();
   leaveok(stdscr, TRUE);
   curs_set(0);
   apply_theme(config);
+  log_input_capabilities(active_mask);
 
   UiState state;
   std::vector<double> gpu_history;
   std::vector<double> power_history;
+  IoHistory io_history;
   int rows = 0;
   int cols = 0;
   getmaxyx(stdscr, rows, cols);
@@ -1856,6 +2359,7 @@ int main(int argc, char** argv) {
     gpu_history.push_back(snapshot.gpu_utilization_percent);
     power_history.push_back(snapshot.system_power_watts);
     const int max_history = std::max(60, 60000 / std::max(100, config.refresh_ms));
+    append_io_history(io_history, snapshot, static_cast<std::size_t>(max_history));
     if (gpu_history.size() > static_cast<std::size_t>(max_history)) {
       gpu_history.erase(gpu_history.begin(), gpu_history.begin() + (gpu_history.size() - max_history));
     }
@@ -1870,7 +2374,10 @@ int main(int argc, char** argv) {
       layout = create_windows(rows, cols);
     }
 
-    std::vector<ProcessRow> process_rows = build_process_rows(snapshot, state);
+    const bool gpu_active_view = state.view_mode == monitor::ViewMode::GpuActive;
+    std::vector<ProcessRow> process_rows = gpu_active_view
+                                               ? build_gpu_active_rows(snapshot, state)
+                                               : build_process_rows(snapshot, state);
     apply_search_request(state, process_rows);
     ProcessViewMetrics process_metrics =
         calculate_process_metrics(process_rows, state, getmaxy(layout.processes));
@@ -1880,12 +2387,24 @@ int main(int argc, char** argv) {
     draw_cpu(layout.cpu, snapshot);
     draw_gpu(layout.gpu, snapshot, gpu_history, power_history, config.refresh_ms);
     draw_memory(layout.memory, snapshot, state);
-    draw_processes(layout.processes, process_rows, state, process_metrics);
+    if (state.view_mode == monitor::ViewMode::SystemIo) {
+      draw_system_io_view(layout.processes, snapshot, io_history, config.refresh_ms);
+    } else if (state.view_mode == monitor::ViewMode::GpuActive) {
+      draw_gpu_active_view(layout.processes, process_rows, state, process_metrics);
+    } else {
+      draw_processes(layout.processes, process_rows, state, process_metrics);
+    }
     draw_footer(layout.footer, state);
     if (state.show_help) {
       draw_help_popup(layout);
     } else if (state.show_setup) {
       draw_setup_popup(layout, state, config);
+    } else if (state.show_process_detail) {
+      if (const auto* process = selected_process(process_rows, state)) {
+        draw_process_detail_popup(layout, *process);
+      } else {
+        state.show_process_detail = false;
+      }
     }
 
     wnoutrefresh(stdscr);
@@ -1897,12 +2416,33 @@ int main(int argc, char** argv) {
     doupdate();
 
     for (int step = 0; step < 20; ++step) {
-      int ch = getch();
+      monitor::InputEvent input = monitor::read_input_event(
+          []() { return getch(); },
+          [](int ch) { ungetch(ch); });
+      int ch = input.key;
+      input_debug_log("getch=%d", ch);
+      if (input.parsed_escape) {
+        input_debug_log("parsed escape sequence key=%d", ch);
+      }
+      if (ch >= KEY_F(1) && ch <= KEY_F(12)) {
+        input_debug_log("function-key=F%d", ch - KEY_F(0));
+      }
       if (ch == KEY_MOUSE) {
         MEVENT event{};
-        if (getmouse(&event) == OK && (event.bstate & BUTTON1_RELEASED)) {
+        bool have_mouse = false;
+        if (input.has_mouse) {
+          event = input.mouse;
+          have_mouse = true;
+          input_debug_log("mouse parsed x=%d y=%d bstate=%lu", event.x, event.y, static_cast<unsigned long>(event.bstate));
+        } else if (getmouse(&event) == OK) {
+          have_mouse = true;
+          input_debug_log("mouse curses x=%d y=%d bstate=%lu", event.x, event.y, static_cast<unsigned long>(event.bstate));
+        }
+        if (have_mouse && is_primary_mouse_activation(event.bstate)) {
+          input_debug_log("mouse x=%d y=%d bstate=%lu", event.x, event.y, static_cast<unsigned long>(event.bstate));
           ch = synthesize_mouse_event(layout, state, process_rows, process_metrics, event);
         } else {
+          input_debug_log("mouse ignored");
           ch = ERR;
         }
       }
@@ -1916,6 +2456,8 @@ int main(int argc, char** argv) {
   }
 
   destroy_windows(layout);
+  clear_terminal_mouse_reporting();
+  close_input_debug_log();
   endwin();
   return 0;
 }
