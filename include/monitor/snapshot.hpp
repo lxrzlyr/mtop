@@ -37,6 +37,8 @@ struct ProcessSnapshot {
   char state = '?';
   bool gpu_active = false;
   std::string core_mix = "-";
+  std::string io = "-";
+  std::string power = "-";
 };
 
 struct CapabilitySnapshot {

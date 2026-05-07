@@ -104,14 +104,13 @@ struct ProcessColumn {
 constexpr ProcessColumn kProcessColumns[] = {
     {"PID", 5, SortMode::Pid, true},
     {"USER", 10, SortMode::Name, false},
-    {"PRI", 4, SortMode::Pid, false},
-    {"NI", 3, SortMode::Pid, false},
-    {"VIRT", 6, SortMode::Mem, false},
-    {"RES", 6, SortMode::Mem, false},
     {"S", 1, SortMode::Pid, false},
     {"CPU%", 5, SortMode::Cpu, true},
-    {"MEM%", 5, SortMode::Mem, true},
-    {"TIME+", 8, SortMode::Time, true},
+    {"MIX", 12, SortMode::Pid, false},
+    {"MEM%", 10, SortMode::Mem, true},
+    {"GPU", 3, SortMode::Pid, false},
+    {"IO", 11, SortMode::Pid, false},
+    {"PWR", 5, SortMode::Pid, false},
 };
 
 RuntimeOptions parse_args(int argc, char** argv) {
@@ -261,6 +260,26 @@ std::string centered_text(const std::string& text, int width) {
   return std::string(left, ' ') + clipped + std::string(right, ' ');
 }
 
+bool is_low_signal_extension_value(const std::string& text) {
+  return text == "root" || text == "wait" || text == "n/a" || text == "0" || text == "0B/0B";
+}
+
+void draw_process_extension_cell(WINDOW* window,
+                                 int y,
+                                 int x,
+                                 int width,
+                                 const std::string& value,
+                                 bool selected) {
+  const bool dim = !selected && is_low_signal_extension_value(value);
+  if (dim) {
+    wattron(window, A_DIM);
+  }
+  mvwprintw(window, y, x, "%*s", width, value.c_str());
+  if (dim) {
+    wattroff(window, A_DIM);
+  }
+}
+
 std::optional<SortMode> process_sort_from_header_x(int local_x) {
   for (int column = 0; column < static_cast<int>(std::size(kProcessColumns)); ++column) {
     const ProcessColumn& def = kProcessColumns[column];
@@ -398,7 +417,7 @@ void print_help() {
 }
 
 void print_version() {
-  std::printf("mtop 1.0.1\n");
+  std::printf("mtop 1.2.0\n");
 }
 
 std::string sort_mode_name(SortMode mode) {
@@ -449,12 +468,18 @@ std::string cpu_topology_summary(const monitor::SystemSnapshot& snapshot) {
     }
   }
 
-  char buffer[64];
-  std::snprintf(buffer, sizeof(buffer), "S%d+P%d+E%d",
-                super_count,
-                performance_count,
-                efficiency_count);
-  return buffer;
+  std::vector<std::string> parts;
+  if (super_count > 0) parts.push_back("S" + std::to_string(super_count));
+  if (performance_count > 0) parts.push_back("P" + std::to_string(performance_count));
+  if (efficiency_count > 0) parts.push_back("E" + std::to_string(efficiency_count));
+  if (parts.empty()) {
+    return "C" + std::to_string(snapshot.cpu_core_count);
+  }
+  std::string result = parts.front();
+  for (std::size_t i = 1; i < parts.size(); ++i) {
+    result += "+" + parts[i];
+  }
+  return result;
 }
 
 double gpu_memory_percent(const monitor::SystemSnapshot& snapshot) {
@@ -477,6 +502,7 @@ void draw_info_bar(const monitor::SystemSnapshot& snapshot, int cols) {
                      " | CPU " + std::to_string(snapshot.cpu_core_count) +
                      " (" + cpu_topology_summary(snapshot) + ")" +
                      " | GPU " + std::to_string(snapshot.gpu_core_count) +
+                     " | Therm: " + snapshot.thermal +
                      " | Uptime: " + format_uptime(snapshot.uptime_seconds) +
                      " | Battery: " + snapshot.battery.description +
                      " | ANE: " + snapshot.ane;
@@ -973,8 +999,20 @@ void draw_gpu(WINDOW* window,
   werase(plot_window);
 
   char legend[4][32] = {};
-  std::snprintf(legend[0], sizeof(legend[0]), "  GPU0 %%");
-  std::snprintf(legend[1], sizeof(legend[1]), "  SOC %.1fW", snapshot.system_power_watts);
+  if (snapshot.gpu_frequency_mhz > 0) {
+    std::snprintf(legend[0], sizeof(legend[0]), "  GPU %d%% @ %d MHz",
+                  static_cast<int>(std::round(snapshot.gpu_utilization_percent)),
+                  snapshot.gpu_frequency_mhz);
+  } else {
+    std::snprintf(legend[0], sizeof(legend[0]), "  GPU %d%%",
+                  static_cast<int>(std::round(snapshot.gpu_utilization_percent)));
+  }
+  if (snapshot.gpu_power_watts > 0.0) {
+    std::snprintf(legend[1], sizeof(legend[1]), "  SOC %.1fW / GPU %.1fW",
+                  snapshot.system_power_watts, snapshot.gpu_power_watts);
+  } else {
+    std::snprintf(legend[1], sizeof(legend[1]), "  SOC %.1fW", snapshot.system_power_watts);
+  }
   nvtop_line_plot_port(plot_window, plot_data.size(), plot_data.data(), 2, true, legend);
   wnoutrefresh(plot_window);
   delwin(plot_window);
@@ -1033,7 +1071,12 @@ void draw_memory(WINDOW* window, const monitor::SystemSnapshot& snapshot, const 
   werase(window);
   wattron(window, COLOR_PAIR(1));
   box(window, 0, 0);
-  mvwprintw(window, 0, 2, " Memory ");
+  if (snapshot.swap_total_bytes > 0 &&
+      static_cast<double>(snapshot.swap_used_bytes) / snapshot.swap_total_bytes > 0.1) {
+    mvwprintw(window, 0, 2, " Memory [WARN] ");
+  } else {
+    mvwprintw(window, 0, 2, " Memory ");
+  }
   wattroff(window, COLOR_PAIR(1));
 
   int max_x = 0;
@@ -1151,14 +1194,32 @@ void draw_processes(WINDOW* window,
     }
     mvwprintw(window, screen_row, process_column_offset(0), "%*d", kProcessColumns[0].width, process.pid);
     mvwprintw(window, screen_row, process_column_offset(1), "%-*.*s", kProcessColumns[1].width, kProcessColumns[1].width, process.user.c_str());
-    mvwprintw(window, screen_row, process_column_offset(2), "%*d", kProcessColumns[2].width, process.priority);
-    mvwprintw(window, screen_row, process_column_offset(3), "%*d", kProcessColumns[3].width, process.nice_value);
-    mvwprintw(window, screen_row, process_column_offset(4), "%*s", kProcessColumns[4].width, compact_bytes(process.virtual_bytes).c_str());
-    mvwprintw(window, screen_row, process_column_offset(5), "%*s", kProcessColumns[5].width, compact_bytes(process.resident_bytes).c_str());
-    mvwprintw(window, screen_row, process_column_offset(6), "%*c", kProcessColumns[6].width, process.state);
-    mvwprintw(window, screen_row, process_column_offset(7), "%*.1f", kProcessColumns[7].width, process.cpu_percent);
-    mvwprintw(window, screen_row, process_column_offset(8), "%*.1f", kProcessColumns[8].width, process.memory_percent);
-    mvwprintw(window, screen_row, process_column_offset(9), "%*s", kProcessColumns[9].width, format_cpu_time(process.total_cpu_time_ns).c_str());
+    mvwprintw(window, screen_row, process_column_offset(2), "%*c", kProcessColumns[2].width, process.state);
+    mvwprintw(window, screen_row, process_column_offset(3), "%*.1f", kProcessColumns[3].width, process.cpu_percent);
+    draw_process_extension_cell(window,
+                                screen_row,
+                                process_column_offset(4),
+                                kProcessColumns[4].width,
+                                process.core_mix,
+                                index == metrics.selected_index);
+    {
+      char mem_buf[16];
+      std::snprintf(mem_buf, sizeof(mem_buf), "%.1f%%/%s", process.memory_percent, compact_bytes(process.resident_bytes).c_str());
+      mvwprintw(window, screen_row, process_column_offset(5), "%*s", kProcessColumns[5].width, mem_buf);
+    }
+    mvwprintw(window, screen_row, process_column_offset(6), "%*c", kProcessColumns[6].width, process.gpu_active ? 'Y' : 'N');
+    draw_process_extension_cell(window,
+                                screen_row,
+                                process_column_offset(7),
+                                kProcessColumns[7].width,
+                                process.io,
+                                index == metrics.selected_index);
+    draw_process_extension_cell(window,
+                                screen_row,
+                                process_column_offset(8),
+                                kProcessColumns[8].width,
+                                process.power,
+                                index == metrics.selected_index);
     mvwprintw(window, screen_row, process_command_offset(), "%s",
               elide_right(command, std::max(0, max_x - process_command_offset() - 1)).c_str());
     if (index == metrics.selected_index) {
@@ -1664,6 +1725,7 @@ monitor::SystemSnapshot apply_demo_snapshot(monitor::SystemSnapshot snapshot, in
     window_server.priority = 17;
     window_server.nice_value = 0;
     window_server.state = 'S';
+    window_server.core_mix = "P:70% E:30%";
 
     monitor::ProcessSnapshot code_renderer = window_server;
     code_renderer.pid = 81325;
@@ -1673,6 +1735,7 @@ monitor::SystemSnapshot apply_demo_snapshot(monitor::SystemSnapshot snapshot, in
     code_renderer.memory_percent = 0.5;
     code_renderer.resident_bytes = 677ULL << 20;
     code_renderer.total_cpu_time_ns = 234170000000ULL;
+    code_renderer.core_mix = "P:85% E:15%";
 
     monitor::ProcessSnapshot plugin = window_server;
     plugin.pid = 81421;
@@ -1683,6 +1746,10 @@ monitor::SystemSnapshot apply_demo_snapshot(monitor::SystemSnapshot snapshot, in
     plugin.resident_bytes = 4837ULL << 20;
     plugin.total_cpu_time_ns = 60780000000ULL;
     plugin.priority = 24;
+    plugin.gpu_active = true;
+    plugin.core_mix = "S:10% P:90%";
+    plugin.io = "45K/12K";
+    plugin.power = "142";
 
     snapshot.processes = {window_server, code_renderer, plugin};
   }

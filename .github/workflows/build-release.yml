@@ -66,15 +66,17 @@ jobs:
           generate_release_notes: true
           files: dist/artifacts/*
 
-  sync-homebrew-tap:
+  refresh-homebrew-formula:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: package-macos
     runs-on: macos-14
     permissions:
-      contents: read
+      contents: write
     steps:
-      - name: Checkout
+      - name: Checkout Main
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Resolve Version
         id: version
@@ -87,53 +89,21 @@ jobs:
           curl -L -o "/tmp/mtop-${VERSION}-source.tar.gz" "https://github.com/lxrzlyr/mtop/releases/download/v${VERSION}/mtop-${VERSION}-source.tar.gz"
           echo "value=$(shasum -a 256 /tmp/mtop-${VERSION}-source.tar.gz | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
-      - name: Start SSH Agent
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.HOMEBREW_TAP_SSH_KEY }}
-
-      - name: Trust GitHub Host Key
+      - name: Update Formula
         run: |
-          mkdir -p ~/.ssh
-          ssh-keyscan github.com >> ~/.ssh/known_hosts
-
-      - name: Clone Homebrew Tap
-        run: git clone git@github.com:lxrzlyr/homebrew-mtop.git /tmp/homebrew-mtop
-
-      - name: Generate Formula
-        run: |
-          ./scripts/generate_homebrew_formula.sh \
+          python3 ./scripts/update_homebrew_formula.py \
+            ./Formula/mtop.rb \
             "${{ steps.version.outputs.value }}" \
-            "${{ steps.sha.outputs.value }}" \
-            /tmp/homebrew-mtop/Formula/mtop.rb
+            "${{ steps.sha.outputs.value }}"
 
-      - name: Commit And Push
+      - name: Commit Formula Refresh
         run: |
-          cd /tmp/homebrew-mtop
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Formula/mtop.rb
           if git diff --cached --quiet; then
-            echo "No tap changes to commit"
+            echo "Formula already matches release"
             exit 0
           fi
-          git commit -m "Update mtop formula to v${{ steps.version.outputs.value }}"
-          git push origin main
-
-      - name: Verify Tap Update
-        run: |
-          rm -rf /tmp/homebrew-mtop-verify
-          git clone git@github.com:lxrzlyr/homebrew-mtop.git /tmp/homebrew-mtop-verify
-          EXPECTED_VERSION="${{ steps.version.outputs.value }}"
-          ACTUAL_VERSION=$(python3 - <<'PY'
-from pathlib import Path
-import re
-text = Path('/tmp/homebrew-mtop-verify/Formula/mtop.rb').read_text()
-match = re.search(r'/releases/download/v([^/]+)/mtop-([^/]+)-source\.tar\.gz', text)
-print(match.group(1) if match else '')
-PY
-)
-          if [[ "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]]; then
-            echo "Tap verification failed: expected v${EXPECTED_VERSION}, got v${ACTUAL_VERSION}" >&2
-            exit 1
-          fi
+          git commit -m "Refresh Formula for v${{ steps.version.outputs.value }}"
+          git push origin HEAD:main

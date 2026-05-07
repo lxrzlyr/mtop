@@ -80,6 +80,22 @@ root 增强模式下：
 - 来自 `powermetrics` 的估算 SoC 子系统功耗
 - GPU 功率 / 频率增强信息
 - 基于 `powermetrics` 推导的进程核心类别混合信息
+- 基于 `powermetrics` 的进程 IO 与 Energy Impact 列
+
+## 进程扩展列说明
+
+在 root 模式下，进程表会尝试显示三列来自 `powermetrics` 的扩展信息：
+
+- `MIX`：采样窗口内的核心类别混合估计，例如 `S:12% P:88%`
+- `IO`：采样窗口内的进程 `Bytes Read / Bytes Written`，例如 `3.9K/7.8K`
+- `PWR`：来自 `powermetrics` 的进程 Energy Impact
+
+这些列都属于 best-effort 的采样窗口指标，阅读时需要注意：
+
+- `0B/0B` 或 `0` 表示该指标可用，但本次采样值为零
+- `n/a` 表示 root 采样已经成功，但 `powermetrics` 在本次采样里没有给这个进程提供可用值
+- `wait` 表示 root 后台采样线程还没有产出第一帧结果
+- `root` 表示这一列需要通过 `sudo ./build/mtop` 才能获得
 
 ## 关于 `SOC` 功耗
 
@@ -216,10 +232,10 @@ cmake --install build --prefix /usr/local
 - 安装到 `dist/install`
 - 用 `cpack` 生成 `.tar.gz`
 
-Homebrew formula stub 在：
+仓库里也包含 Homebrew formula，位置在：
 
 ```text
-packaging/homebrew/mtop.rb
+Formula/mtop.rb
 ```
 
 ## GitHub Actions
@@ -242,33 +258,32 @@ packaging/homebrew/mtop.rb
 推荐发布流程：
 
 1. 正常 push 代码，用 workflow artifacts 检查打包结果。
-2. 创建版本 tag，例如 `v1.0.1`。
+2. 创建版本 tag，例如 `v1.2.0`。
 3. push 这个 tag。
 4. GitHub Actions 会自动构建并把包挂到 Release 上。
 
-## Homebrew Tap 的关系
+## Homebrew
 
-`mtop` 和 `homebrew-mtop` 应该保持为两个独立仓库。
+`mtop` 现在采用单仓库的 Homebrew 布局。
 
-- `mtop` 是源码仓库
-- `homebrew-mtop` 是 Homebrew tap 仓库
+- 源码、release 产物和 Homebrew formula 都放在这个仓库里
+- 当前公式文件位于 `Formula/mtop.rb`
 
-这样做是有意为之：
+这样发布链路会更简单：
 
-- 有些用户会手动从源码构建
-- 有些用户只想通过 Homebrew 安装
-- tap 仓库只维护 formula，不需要承载完整源码历史
+- 只维护一个 release 仓库
+- 不再需要跨仓库同步 workflow
+- 不再需要额外 deploy key 或 tap secret
 
-主仓库里已经包含了公式生成脚本和 tap 同步工作流：
+如果你想直接从这个仓库通过 Homebrew 安装，可以使用：
 
-- [scripts/generate_homebrew_formula.sh](./scripts/generate_homebrew_formula.sh)
-- [.github/workflows/update-homebrew-tap.yml](./.github/workflows/update-homebrew-tap.yml)
+```bash
+brew install lxrzlyr/mtop/mtop
+```
 
-如果你希望在打 tag 后自动更新 tap，需要在 `mtop` 仓库中配置这个 secret：
+如果要为新版本更新公式，只需要同步修改 `Formula/mtop.rb` 中的 `url` 和 `sha256`，让它们对应新的 source release asset。
 
-- `HOMEBREW_TAP_SSH_KEY`
-
-这个 key 需要对 `lxrzlyr/homebrew-mtop` 有写权限。
+当前 release workflow 只负责本仓库的构建、打包和 release 资产上传。
 
 ## 项目结构
 
@@ -277,6 +292,7 @@ include/     公共头文件
 src/         C++ / Objective-C++ 实现
 docs/        设计与平台说明
 tests/       测试与测试计划
+Formula/     Homebrew formula
 packaging/   打包相关元数据
 scripts/     辅助脚本
 ```

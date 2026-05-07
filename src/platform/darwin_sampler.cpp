@@ -298,6 +298,8 @@ char process_state_char(uint32_t status) {
   }
 }
 
+std::string trim_copy(const std::string& text);
+
 std::string process_command(pid_t pid, const proc_bsdinfo& bsd_info) {
   char path_buffer[PROC_PIDPATHINFO_MAXSIZE] = {};
   if (proc_pidpath(pid, path_buffer, sizeof(path_buffer)) > 0) {
@@ -321,7 +323,7 @@ std::vector<std::string> split_multi_space(const std::string& line) {
       ++space_run;
       if (space_run >= 2) {
         if (!current.empty()) {
-          result.push_back(current);
+          result.push_back(trim_copy(current));
           current.clear();
         }
       } else if (!current.empty()) {
@@ -333,9 +335,115 @@ std::vector<std::string> split_multi_space(const std::string& line) {
     }
   }
   if (!current.empty()) {
-    result.push_back(current);
+    result.push_back(trim_copy(current));
   }
   return result;
+}
+
+std::string trim_copy(const std::string& text) {
+  const std::size_t start = text.find_first_not_of(" \t\r\n");
+  if (start == std::string::npos) {
+    return "";
+  }
+  const std::size_t end = text.find_last_not_of(" \t\r\n");
+  return text.substr(start, end - start + 1);
+}
+
+std::string lowercase_copy(std::string text) {
+  std::transform(text.begin(), text.end(), text.begin(),
+                 [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  return text;
+}
+
+std::string compact_count(double value) {
+  static const char* units[] = {"", "K", "M", "G", "T"};
+  int unit = 0;
+  while (std::fabs(value) >= 1000.0 && unit < 4) {
+    value /= 1000.0;
+    ++unit;
+  }
+  char buffer[16];
+  if (std::fabs(value) >= 100.0 || unit == 0) {
+    std::snprintf(buffer, sizeof(buffer), "%.0f%s", value, units[unit]);
+  } else {
+    std::snprintf(buffer, sizeof(buffer), "%.1f%s", value, units[unit]);
+  }
+  return buffer;
+}
+
+std::string compact_io_bytes(double value) {
+  static const char* units[] = {"B", "K", "M", "G", "T"};
+  int unit = 0;
+  while (std::fabs(value) >= 1024.0 && unit < 4) {
+    value /= 1024.0;
+    ++unit;
+  }
+  char buffer[16];
+  if (unit == 0 || std::fabs(value) >= 10.0) {
+    std::snprintf(buffer, sizeof(buffer), "%.0f%s", value, units[unit]);
+  } else {
+    std::snprintf(buffer, sizeof(buffer), "%.1f%s", value, units[unit]);
+  }
+  return buffer;
+}
+
+bool is_numeric_field(const std::string& text) {
+  const std::string trimmed = trim_copy(text);
+  if (trimmed.empty()) {
+    return false;
+  }
+  bool has_digit = false;
+  for (char ch : trimmed) {
+    const unsigned char uch = static_cast<unsigned char>(ch);
+    if (std::isdigit(uch)) {
+      has_digit = true;
+      continue;
+    }
+    if (ch == '.' || ch == '+' || ch == '-' || ch == 'e' || ch == 'E') {
+      continue;
+    }
+    return false;
+  }
+  return has_digit;
+}
+
+std::vector<std::string> split_numeric_subfields(const std::string& field) {
+  std::vector<std::string> parts;
+  std::istringstream stream(field);
+  std::string part;
+  while (stream >> part) {
+    if (!is_numeric_field(part)) {
+      return {};
+    }
+    parts.push_back(part);
+  }
+  if (parts.size() < 2) {
+    return {};
+  }
+  return parts;
+}
+
+void split_merged_numeric_fields(std::vector<std::string>& fields, std::size_t expected_size) {
+  for (std::string& field : fields) {
+    field = trim_copy(field);
+  }
+  while (fields.size() < expected_size) {
+    bool changed = false;
+    for (std::size_t index = 0; index < fields.size(); ++index) {
+      const std::string& field = fields[index];
+      std::vector<std::string> parts = split_numeric_subfields(field);
+      if (parts.empty()) {
+        continue;
+      }
+      fields[index] = std::move(parts.front());
+      fields.insert(fields.begin() + static_cast<std::ptrdiff_t>(index + 1), parts.begin() + 1, parts.end());
+      changed = true;
+      break;
+    }
+    if (!changed) {
+      break;
+    }
+  }
 }
 
 std::vector<std::string> expand_amp_header(const std::vector<std::string>& fields) {
@@ -360,66 +468,145 @@ std::vector<std::string> expand_amp_header(const std::vector<std::string>& field
   return expanded;
 }
 
-std::map<int, std::string> parse_amp_core_mix(const std::string& text) {
-  std::map<int, std::string> result;
+struct AmpData {
+  std::map<int, std::string> core_mix;
+  std::map<int, std::string> io;
+  std::map<int, std::string> power;
+};
+
+AmpData parse_amp_data(const std::string& text, bool has_super) {
+  AmpData result;
   std::istringstream input(text);
   std::string line;
   bool in_tasks = false;
   std::vector<std::string> header;
   while (std::getline(input, line)) {
-    if (line.find("*** Running tasks ***") != std::string::npos) {
+    const std::string trimmed = trim_copy(line);
+    if (trimmed.find("*** Running tasks ***") != std::string::npos) {
       in_tasks = true;
       continue;
     }
     if (!in_tasks) {
       continue;
     }
-    if (line.rfind("****", 0) == 0) {
+    if (trimmed.rfind("****", 0) == 0) {
       break;
     }
-    if (line.empty()) {
+    if (trimmed.empty()) {
       continue;
     }
-    if (line.rfind("Name", 0) == 0 && line.find("CPU ms/s") != std::string::npos) {
-      header = expand_amp_header(split_multi_space(line));
+    if (trimmed.rfind("Name", 0) == 0 && trimmed.find("CPU ms/s") != std::string::npos) {
+      header = expand_amp_header(split_multi_space(trimmed));
       continue;
     }
     if (header.empty()) {
       continue;
     }
-    std::vector<std::string> values = split_multi_space(line);
+    std::vector<std::string> values = split_multi_space(trimmed);
+    split_merged_numeric_fields(values, header.size());
     if (values.size() != header.size()) {
       continue;
     }
     std::map<std::string, std::string> row;
     for (std::size_t i = 0; i < header.size(); ++i) {
-      row[header[i]] = values[i];
+      row[trim_copy(header[i])] = trim_copy(values[i]);
     }
-    const int pid = std::atoi(row["ID"].c_str());
+    const auto id_it = row.find("ID") != row.end() ? row.find("ID") : row.find("PID");
+    if (id_it == row.end()) {
+      continue;
+    }
+    const int pid = std::atoi(id_it->second.c_str());
     if (pid <= 0) {
       continue;
     }
-    double super_percent = 0.0;
+
+    // Core mix
+    double primary_percent = 0.0;
+    const char* primary_label = nullptr;
+    const char* secondary_label = nullptr;
+
     if (row.count("%SCPU")) {
-      super_percent = std::atof(row["%SCPU"].c_str());
+      primary_percent = std::atof(row["%SCPU"].c_str());
+      primary_label = has_super ? "S" : "P";
+      secondary_label = has_super ? "P" : "E";
     } else if (row.count("SCPU ms/s") && row.count("CPU ms/s")) {
       const double total = std::atof(row["CPU ms/s"].c_str());
-      const double super_ms = std::atof(row["SCPU ms/s"].c_str());
+      const double primary_ms = std::atof(row["SCPU ms/s"].c_str());
       if (total > 0.0) {
-        super_percent = super_ms * 100.0 / total;
+        primary_percent = primary_ms * 100.0 / total;
+      }
+      primary_label = has_super ? "S" : "P";
+      secondary_label = has_super ? "P" : "E";
+    } else if (row.count("%PCPU")) {
+      primary_percent = std::atof(row["%PCPU"].c_str());
+      primary_label = "P";
+      secondary_label = "E";
+    } else if (row.count("PCPU ms/s") && row.count("CPU ms/s")) {
+      const double total = std::atof(row["CPU ms/s"].c_str());
+      const double primary_ms = std::atof(row["PCPU ms/s"].c_str());
+      if (total > 0.0) {
+        primary_percent = primary_ms * 100.0 / total;
+      }
+      primary_label = "P";
+      secondary_label = "E";
+    }
+
+    if (!primary_label) {
+      primary_label = "P";
+      secondary_label = "E";
+    }
+
+    const double secondary_percent = std::max(0.0, 100.0 - primary_percent);
+    char buffer[64];
+    std::snprintf(buffer, sizeof(buffer), "%s:%d%% %s:%d%%",
+                  primary_label,
+                  static_cast<int>(std::round(primary_percent)),
+                  secondary_label,
+                  static_cast<int>(std::round(secondary_percent)));
+    result.core_mix[pid] = buffer;
+
+    // IO: look for disk IO columns
+    double disk_read = 0.0, disk_write = 0.0;
+    bool saw_io_column = false;
+    for (const auto& [col, val] : row) {
+      const std::string lower_col = lowercase_copy(col);
+      const bool io_column = lower_col.find("disk") != std::string::npos ||
+                             lower_col.find("io") != std::string::npos ||
+                             lower_col.find("bytes") != std::string::npos;
+      if (!io_column) {
+        continue;
+      }
+      saw_io_column = true;
+      if (lower_col.find("read") != std::string::npos) {
+        disk_read += std::atof(val.c_str());
+      } else if (lower_col.find("write") != std::string::npos ||
+                 lower_col.find("written") != std::string::npos) {
+        disk_write += std::atof(val.c_str());
       }
     }
-    const double performance_percent = std::max(0.0, 100.0 - super_percent);
-    char buffer[64];
-    std::snprintf(buffer, sizeof(buffer), "S:%d%% P:%d%%",
-                  static_cast<int>(std::round(super_percent)),
-                  static_cast<int>(std::round(performance_percent)));
-    result[pid] = buffer;
+    if (saw_io_column) {
+      char buf[32];
+      std::snprintf(buf, sizeof(buf), "%s/%s", compact_io_bytes(disk_read).c_str(), compact_io_bytes(disk_write).c_str());
+      result.io[pid] = buf;
+    }
+
+    // Power: look for energy impact column
+    for (const auto& [col, val] : row) {
+      const std::string lower_col = lowercase_copy(col);
+      if (lower_col.find("energy") != std::string::npos || lower_col.find("impact") != std::string::npos) {
+        const double energy = std::atof(val.c_str());
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%.0f", energy);
+        result.power[pid] = buf;
+        break;
+      }
+    }
   }
   return result;
 }
 
 struct RootMetrics {
+  bool sampled = false;
   bool available = false;
   bool ane_available = false;
   std::string thermal = "N/A";
@@ -429,6 +616,8 @@ struct RootMetrics {
   double total_power_watts = 0.0;
   int gpu_frequency_mhz = 0;
   std::map<int, std::string> process_core_mix;
+  std::map<int, std::string> process_io;
+  std::map<int, std::string> process_power;
 };
 
 class DarwinSampler final : public Sampler {
@@ -586,6 +775,9 @@ class DarwinSampler final : public Sampler {
   }
 
   void sample_processes() {
+    const char* missing_root_detail = !snapshot_.capabilities.root_mode
+                                          ? "root"
+                                          : (!cached_root_metrics_.sampled ? "wait" : "n/a");
     const auto now = std::chrono::steady_clock::now();
     const double elapsed_seconds =
         last_process_sample_time_.time_since_epoch().count() == 0
@@ -649,7 +841,11 @@ class DarwinSampler final : public Sampler {
                                  ? static_cast<double>(task_info.pti_resident_size) * 100.0 / static_cast<double>(snapshot_.memory_total_bytes)
                                  : 0.0;
       auto core_mix_it = cached_root_metrics_.process_core_mix.find(pid);
-      process.core_mix = core_mix_it != cached_root_metrics_.process_core_mix.end() ? core_mix_it->second : "-";
+      process.core_mix = core_mix_it != cached_root_metrics_.process_core_mix.end() ? core_mix_it->second : missing_root_detail;
+      auto io_it = cached_root_metrics_.process_io.find(pid);
+      process.io = io_it != cached_root_metrics_.process_io.end() ? io_it->second : missing_root_detail;
+      auto power_it = cached_root_metrics_.process_power.find(pid);
+      process.power = power_it != cached_root_metrics_.process_power.end() ? power_it->second : missing_root_detail;
       processes.push_back(process);
     }
 
@@ -699,6 +895,7 @@ class DarwinSampler final : public Sampler {
 
   RootMetrics collect_root_metrics() {
     RootMetrics metrics;
+    metrics.sampled = true;
     char plist_template[] = "/tmp/mtop-powermetrics-XXXXXX";
     int fd = mkstemp(plist_template);
     if (fd >= 0) {
@@ -802,15 +999,38 @@ class DarwinSampler final : public Sampler {
       std::remove(plist_template);
     }
 
+    const bool has_super = [&] {
+      for (const auto& level : perf_levels()) {
+        if (level.name == "Super") return true;
+      }
+      return false;
+    }();
     const std::string amp_text = run_command_capture({
         "/usr/bin/powermetrics",
-        "--samplers", "tasks,cpu_power",
+        "--samplers", "tasks,cpu_power,disk",
         "--show-process-amp",
+        "--show-process-io",
+        "--show-process-energy",
         "--show-process-ipc",
         "-n", "1",
         "-i", "1000",
     }, true);
-    metrics.process_core_mix = parse_amp_core_mix(amp_text);
+    AmpData amp = parse_amp_data(amp_text, has_super);
+    if (amp.core_mix.empty() && amp.io.empty() && amp.power.empty()) {
+      AmpData fallback = parse_amp_data(run_command_capture({
+          "/usr/bin/powermetrics",
+          "--samplers", "tasks,cpu_power",
+          "--show-process-amp",
+          "--show-process-energy",
+          "-n", "1",
+          "-i", "1000",
+      }, true), has_super);
+      if (amp.core_mix.empty()) amp.core_mix = std::move(fallback.core_mix);
+      if (amp.power.empty()) amp.power = std::move(fallback.power);
+    }
+    metrics.process_core_mix = std::move(amp.core_mix);
+    metrics.process_io = std::move(amp.io);
+    metrics.process_power = std::move(amp.power);
     return metrics;
   }
 

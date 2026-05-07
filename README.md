@@ -80,6 +80,22 @@ With root:
 - estimated SoC subsystem power from `powermetrics`
 - GPU power / frequency enrichment
 - process core-class mix derived from `powermetrics`
+- process IO and energy-impact columns derived from `powermetrics`
+
+## Process Extension Columns
+
+In root mode, the process table can show three extra columns sourced from `powermetrics`:
+
+- `MIX`: estimated core-class mix for the sampled window, such as `S:12% P:88%`
+- `IO`: per-process `Bytes Read / Bytes Written` activity during the sample window, such as `3.9K/7.8K`
+- `PWR`: per-process Energy Impact from `powermetrics`
+
+These columns are best-effort and sample-window based, so they should be read with a few caveats:
+
+- `0B/0B` or `0` means the metric was available and the sampled value was zero
+- `n/a` means root sampling succeeded, but `powermetrics` did not provide a usable value for that process in that sample
+- `wait` means root sampling has not delivered its first background sample yet
+- `root` means the column requires `sudo ./build/mtop`
 
 ## A Note About `SOC` Power
 
@@ -216,10 +232,10 @@ This will:
 - install into `dist/install`
 - produce a `.tar.gz` package through `cpack`
 
-There is also a Homebrew formula stub at:
+The repository also includes a Homebrew formula at:
 
 ```text
-packaging/homebrew/mtop.rb
+Formula/mtop.rb
 ```
 
 ## GitHub Actions
@@ -242,38 +258,32 @@ Current workflow file:
 Recommended release flow:
 
 1. Push normal commits and use the workflow artifacts to verify packaging.
-2. Create a version tag such as `v1.0.1`.
+2. Create a version tag such as `v1.2.0`.
 3. Push the tag.
 4. GitHub Actions will build and attach the package to the release.
-5. The same release workflow will update the Homebrew tap and verify the formula matches the new version.
 
-## Homebrew Tap Relationship
+## Homebrew
 
-`mtop` and `homebrew-mtop` should remain separate repositories.
+`mtop` now uses a single-repository Homebrew layout.
 
-- `mtop` is the source repository
-- `homebrew-mtop` is the Homebrew tap repository
+- source code, release artifacts, and the Homebrew formula all live in this repository
+- the checked-in formula is located at `Formula/mtop.rb`
 
-That separation is intentional:
+This keeps the release flow simpler:
 
-- some users want to build from source manually
-- some users want to install with Homebrew
-- the tap should only carry the formula, not the whole source history
+- one release repository to version and debug
+- no cross-repository sync job
+- no extra deploy key or tap-specific secret
 
-This repository includes a formula generator and a tap sync workflow:
+If you want to install from this repository with Homebrew, use:
 
-- [scripts/generate_homebrew_formula.sh](./scripts/generate_homebrew_formula.sh)
-- [.github/workflows/update-homebrew-tap.yml](./.github/workflows/update-homebrew-tap.yml)
+```bash
+brew install lxrzlyr/mtop/mtop
+```
 
-The tag-based release workflow also performs the tap update and verification step, so the release job fails if the tap does not match the published version.
+To refresh the formula for a new version locally, regenerate or update `Formula/mtop.rb` so that its `url` and `sha256` match the new source release asset.
 
-`update-homebrew-tap.yml` remains available as a manual repair path if a release needs the tap formula to be resynced explicitly.
-
-To enable automatic tap updates, add this secret to the `mtop` GitHub repository:
-
-- `HOMEBREW_TAP_SSH_KEY`
-
-That key should be a deploy key or SSH key with write access to `lxrzlyr/homebrew-mtop`.
+The release workflow now only builds, packages, and uploads artifacts for this repository.
 
 ## Project Layout
 
@@ -282,6 +292,7 @@ include/     public headers
 src/         C++ / Objective-C++ implementation
 docs/        design and platform notes
 tests/       test planning and future test code
+Formula/     Homebrew formula
 packaging/   package metadata
 scripts/     helper scripts
 ```
