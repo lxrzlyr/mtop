@@ -227,7 +227,7 @@ CLI overrides:
 ./build/mtop --debug-input --debug-log /tmp/mtop-input.log
 ```
 
-## Package And Install
+## Install And Package
 
 Install locally:
 
@@ -235,102 +235,17 @@ Install locally:
 cmake --install build --prefix /usr/local
 ```
 
-Build a release package:
+Build a local release archive:
 
 ```bash
 ./scripts/release.sh
 ```
 
-This will:
-
-- configure the project
-- build it
-- run tests
-- install into `dist/install`
-- produce a `.tar.gz` package through `cpack`
-
-The repository also includes a Homebrew formula at:
-
-```text
-Formula/mtop.rb
-```
-
-## GitHub Actions
-
-The repository includes a GitHub Actions workflow that:
-
-- builds on macOS
-- runs tests
-- installs into a staging directory
-- generates a release archive with `cpack`
-- uploads artifacts
-- attaches packaged archives to GitHub Releases for version tags
-
-Current workflow file:
-
-```text
-.github/workflows/build-release.yml
-```
-
-Recommended release flow:
-
-1. Push normal commits and use the workflow artifacts to verify packaging.
-2. Create a version tag such as `v1.2.0`.
-3. Push the tag.
-4. GitHub Actions will build and attach the package to the release.
-
-## Homebrew
-
-`mtop` now uses a single-repository Homebrew layout.
-
-- source code, release artifacts, and the Homebrew formula all live in this repository
-- the checked-in formula is located at `Formula/mtop.rb`
-
-This keeps the release flow simpler:
-
-- one release repository to version and debug
-- no cross-repository sync job
-- no extra deploy key or tap-specific secret
-
-If you want to install from this repository with Homebrew, use:
+If you are installing with Homebrew, use:
 
 ```bash
 brew install lxrzlyr/mtop/mtop
 ```
-
-To refresh the formula for a new version locally, regenerate or update `Formula/mtop.rb` so that its `url` and `sha256` match the new source release asset.
-
-The release workflow now only builds, packages, and uploads artifacts for this repository.
-
-## Project Layout
-
-```text
-include/     public headers
-src/         C++ / Objective-C++ implementation
-docs/        design and platform notes
-tests/       test planning and future test code
-Formula/     Homebrew formula
-packaging/   package metadata
-scripts/     helper scripts
-```
-
-## Roadmap
-
-Likely next features:
-
-- richer setup panel
-- better process tree visuals and tagging
-- improved root telemetry presentation
-- clearer power breakdowns
-- optional compact header / dense mode
-- export / snapshot support
-- better per-process GPU attribution where macOS exposes enough data
-
-Suggestions are welcome. If you use this on real workloads, the most useful feedback is usually:
-
-- what you were doing
-- what information you expected to see
-- what felt noisy, misleading, or missing
 
 ## Acknowledgements
 

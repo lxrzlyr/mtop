@@ -235,102 +235,17 @@ CLI 覆盖：
 cmake --install build --prefix /usr/local
 ```
 
-发布打包：
+本地打包：
 
 ```bash
 ./scripts/release.sh
 ```
 
-它会：
-
-- 配置工程
-- 编译
-- 跑测试
-- 安装到 `dist/install`
-- 用 `cpack` 生成 `.tar.gz`
-
-仓库里也包含 Homebrew formula，位置在：
-
-```text
-Formula/mtop.rb
-```
-
-## GitHub Actions
-
-仓库已经包含 GitHub Actions 工作流，会：
-
-- 在 macOS 上构建
-- 运行测试
-- 安装到 staging 目录
-- 使用 `cpack` 生成发布包
-- 上传 artifacts
-- 对版本 tag 自动附加 Release 资产
-
-工作流文件：
-
-```text
-.github/workflows/build-release.yml
-```
-
-推荐发布流程：
-
-1. 正常 push 代码，用 workflow artifacts 检查打包结果。
-2. 创建版本 tag，例如 `v1.2.0`。
-3. push 这个 tag。
-4. GitHub Actions 会自动构建并把包挂到 Release 上。
-
-## Homebrew
-
-`mtop` 现在采用单仓库的 Homebrew 布局。
-
-- 源码、release 产物和 Homebrew formula 都放在这个仓库里
-- 当前公式文件位于 `Formula/mtop.rb`
-
-这样发布链路会更简单：
-
-- 只维护一个 release 仓库
-- 不再需要跨仓库同步 workflow
-- 不再需要额外 deploy key 或 tap secret
-
-如果你想直接从这个仓库通过 Homebrew 安装，可以使用：
+如果你通过 Homebrew 安装，可以使用：
 
 ```bash
 brew install lxrzlyr/mtop/mtop
 ```
-
-如果要为新版本更新公式，只需要同步修改 `Formula/mtop.rb` 中的 `url` 和 `sha256`，让它们对应新的 source release asset。
-
-当前 release workflow 只负责本仓库的构建、打包和 release 资产上传。
-
-## 项目结构
-
-```text
-include/     公共头文件
-src/         C++ / Objective-C++ 实现
-docs/        设计与平台说明
-tests/       测试与测试计划
-Formula/     Homebrew formula
-packaging/   打包相关元数据
-scripts/     辅助脚本
-```
-
-## 未来功能
-
-计划中的方向：
-
-- 更丰富的 setup 面板
-- 更完整的树形进程可视化和标记机制
-- 更清晰的 root telemetry 展示
-- 更好的功耗拆分说明
-- 可选的 compact / dense 模式
-- 导出 / snapshot 支持
-- 在 macOS 能提供足够数据的前提下，增强进程级 GPU 归因
-
-也欢迎提建议。最有价值的反馈通常包括：
-
-- 你在做什么工作负载
-- 你希望看到什么信息
-- 哪些地方显得吵、误导、或者缺失
 
 ## 致谢
 
