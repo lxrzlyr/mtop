@@ -2,7 +2,7 @@ class Mtop < Formula
   desc "Apple Silicon terminal monitor for macOS"
   homepage "https://github.com/lxrzlyr/mtop"
   url "https://github.com/lxrzlyr/mtop/releases/download/v1.2.0/mtop-1.2.0-source.tar.gz"
-  sha256 "1f56fc7f55ae0ba00fd964d103a643b4203a6656ddbeb69dfa5b8cf266f2ac41"
+  sha256 "54537a4b654f2aa0c843a96bd0aeeaa5ee807c0b5a5d2158a5ee6d8f4c9434a5"
   license "GPL-3.0-or-later"
 
   depends_on "cmake" => :build
