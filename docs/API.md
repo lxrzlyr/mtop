@@ -2,6 +2,12 @@
 
 This document describes the repository layout, core data model, and internal C++ APIs used by mtop.
 
+Current stable release: `v1.4.0`.
+
+`v1.4.0` completed the 1.4 stabilization work: System I/O now separates block storage from VM paging, metric availability has explicit status/reason fields, root-enhanced sampling is timeout/stale-aware, and demo mode uses a dedicated synthetic sampler.
+
+The next planned internal API surface is `v1.5.0`, centered on JSON snapshot output and small configuration/data-model extensions.
+
 ## Repository Layout
 
 - `src/main.cpp`: ncurses application shell, CLI parsing, layout, view rendering, input dispatch, and demo snapshot shaping.
@@ -25,7 +31,7 @@ This document describes the repository layout, core data model, and internal C++
 5. The UI renders CPU, GPU, memory, process, System I/O, and detail views from the snapshot.
 6. In root mode, the Darwin sampler runs `powermetrics` on a background thread and merges the latest root-enhanced sample into the main snapshot.
 
-Snapshot mode is not implemented in 1.4.
+Snapshot mode is not implemented in 1.4. It is planned for 1.5 as a non-curses output path built from `SystemSnapshot`.
 
 ## Core Data Model
 

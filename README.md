@@ -131,6 +131,8 @@ That means:
 
 ## Current Feature Set
 
+Current stable release: `v1.4.0`.
+
 - Apple Silicon-aware CPU panel with core-class grouping
 - compact CPU cluster summary line
 - `htop`-style main process table
@@ -147,6 +149,12 @@ That means:
 - demo mode for UI iteration
 - standalone input diagnostic utility for terminal compatibility debugging
 - release packaging with `cpack`
+
+## Release Status
+
+`v1.4.0` is the completed 1.4 stabilization release. It corrected System I/O semantics, added explicit metric availability status, made root-enhanced sampling timeout/stale-aware, refreshed demo mode with synthetic data, and consolidated docs.
+
+The next 1.x target is `v1.5.0`, focused on JSON snapshot output, lightweight config expansion, small process-table quality-of-life improvements, and 2.0 data-model preparation.
 
 ## Build
 
