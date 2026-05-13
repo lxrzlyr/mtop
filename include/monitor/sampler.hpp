@@ -11,5 +11,6 @@ class Sampler {
 };
 
 Sampler* create_darwin_sampler();
+Sampler* create_demo_sampler();
 
 }  // namespace monitor

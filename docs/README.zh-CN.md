@@ -1,6 +1,6 @@
 # mtop
 
-[English](./README.md) | [简体中文](./README.zh-CN.md)
+[English](../README.md) | [简体中文](./README.zh-CN.md)
 
 `mtop` 是一个面向 Apple Silicon Mac 的终端监控工具。
 
@@ -35,7 +35,7 @@ mtop --demo
 
 ## 截图
 
-![mtop demo](./docs/assets/mtop-demo.png)
+![mtop demo](./assets/mtop-demo.png)
 
 ## 为什么要做这个工具
 

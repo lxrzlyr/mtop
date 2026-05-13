@@ -1,6 +1,6 @@
 # mtop
 
-[English](./README.md) | [简体中文](./README.zh-CN.md)
+[English](./README.md) | [简体中文](./docs/README.zh-CN.md)
 
 `mtop` is a terminal monitor built for Apple Silicon Macs.
 

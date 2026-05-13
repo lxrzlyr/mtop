@@ -2,6 +2,7 @@ build/
 dist/
 _CPack_Packages/
 .cache/
+tmp/
 .git.old-history/
 .DS_Store
 **/.DS_Store

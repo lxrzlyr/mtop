@@ -537,7 +537,7 @@ void print_help() {
 }
 
 void print_version() {
-  std::printf("mtop 1.3.0\n");
+  std::printf("mtop 1.4.0\n");
 }
 
 std::string sort_mode_name(monitor::SortMode mode) {
@@ -2184,109 +2184,6 @@ bool handle_input(int ch,
   }
 }
 
-monitor::SystemSnapshot apply_demo_snapshot(monitor::SystemSnapshot snapshot, int tick) {
-  snapshot.capabilities.root_mode = false;
-  snapshot.thermal = "Nominal";
-  snapshot.ane = "N/A without root";
-  snapshot.gpu_utilization_percent = 15.0 + 10.0 * std::sin(static_cast<double>(tick) / 5.0);
-  snapshot.gpu_summary = std::to_string(static_cast<int>(snapshot.gpu_utilization_percent)) + "% util";
-  snapshot.system_power_watts = 18.0 + 6.0 * std::sin(static_cast<double>(tick) / 6.0);
-  snapshot.gpu_power_watts = 2.5 + 1.2 * std::max(0.0, std::sin(static_cast<double>(tick) / 4.0));
-  snapshot.gpu_frequency_mhz = 420 + static_cast<int>(80.0 * std::max(0.0, std::sin(static_cast<double>(tick) / 5.0)));
-  snapshot.gpu_memory_total_bytes = snapshot.memory_total_bytes > 0 ? snapshot.memory_total_bytes : (128ULL << 30);
-  snapshot.gpu_memory_used_bytes = static_cast<std::uint64_t>(
-      (5.0 + 2.0 * std::max(0.0, std::sin(static_cast<double>(tick) / 6.0))) * 1024.0 * 1024.0 * 1024.0);
-  snapshot.disk_io.available = true;
-  snapshot.disk_io.status.availability = monitor::MetricAvailability::Available;
-  snapshot.disk_io.status.reason = "demo block storage counters";
-  snapshot.disk_io.read_bytes_per_sec = static_cast<std::uint64_t>(2.5 * 1024.0 * 1024.0 * std::max(0.0, 1.0 + std::sin(static_cast<double>(tick) / 7.0)));
-  snapshot.disk_io.write_bytes_per_sec = static_cast<std::uint64_t>(1.2 * 1024.0 * 1024.0 * std::max(0.0, 1.0 + std::cos(static_cast<double>(tick) / 8.0)));
-  snapshot.paging_io.available = true;
-  snapshot.paging_io.status.availability = monitor::MetricAvailability::Available;
-  snapshot.paging_io.status.reason = "demo VM page activity";
-  snapshot.paging_io.pageins_bytes_per_sec = static_cast<std::uint64_t>(128.0 * 1024.0 * std::max(0.0, 1.0 + std::sin(static_cast<double>(tick) / 11.0)));
-  snapshot.paging_io.pageouts_bytes_per_sec = static_cast<std::uint64_t>(64.0 * 1024.0 * std::max(0.0, 1.0 + std::cos(static_cast<double>(tick) / 12.0)));
-  snapshot.network_io.available = true;
-  snapshot.network_io.status.availability = monitor::MetricAvailability::Available;
-  snapshot.network_io.status.reason = "demo network counters";
-  snapshot.network_io.rx_bytes_per_sec = static_cast<std::uint64_t>(6.0 * 1024.0 * 1024.0 * std::max(0.0, 0.5 + std::sin(static_cast<double>(tick) / 9.0)));
-  snapshot.network_io.tx_bytes_per_sec = static_cast<std::uint64_t>(1.5 * 1024.0 * 1024.0 * std::max(0.0, 0.5 + std::cos(static_cast<double>(tick) / 10.0)));
-  snapshot.capabilities.root_process_status.availability = monitor::MetricAvailability::RequiresRoot;
-  snapshot.capabilities.root_process_status.reason = "demo non-root mode";
-  snapshot.capabilities.gpu_total_status.availability = monitor::MetricAvailability::Available;
-  snapshot.capabilities.gpu_total_status.reason = "demo GPU counters";
-  snapshot.capabilities.gpu_per_process_status.availability = monitor::MetricAvailability::Available;
-  snapshot.capabilities.gpu_per_process_status.reason = "demo active PID list";
-  for (std::size_t i = 0; i < snapshot.cpu_cores.size(); ++i) {
-    const double base = 10.0 + (i % 6) * 8.0;
-    snapshot.cpu_cores[i].utilization_percent =
-        std::clamp(base + 20.0 * std::sin((tick + static_cast<int>(i)) / 3.0), 0.0, 100.0);
-  }
-  for (auto& cluster : snapshot.cpu_clusters) {
-    double total = 0.0;
-    int count = 0;
-    for (const auto& core : snapshot.cpu_cores) {
-      if (core.cluster_type != cluster.name) {
-        continue;
-      }
-      total += core.utilization_percent;
-      ++count;
-    }
-    cluster.core_count = count;
-    cluster.utilization_percent = count > 0 ? total / static_cast<double>(count) : 0.0;
-    cluster.frequency_available = true;
-    cluster.frequency_mhz = cluster.label == 'S' ? 4200 : cluster.label == 'P' ? 2400 : 1450;
-  }
-  snapshot.memory_pressure = monitor::derive_memory_pressure(snapshot);
-
-  if (snapshot.processes.empty()) {
-    monitor::ProcessSnapshot window_server;
-    window_server.pid = 411;
-    window_server.parent_pid = 1;
-    window_server.name = "WindowServer";
-    window_server.command = "/System/Library/PrivateFrameworks/SkyLight.framework/WindowServer";
-    window_server.user = "demo";
-    window_server.cpu_percent = 3.0;
-    window_server.memory_percent = 0.7;
-    window_server.resident_bytes = 937ULL << 20;
-    window_server.virtual_bytes = 1833ULL << 30;
-    window_server.total_cpu_time_ns = 375060000000ULL;
-    window_server.priority = 17;
-    window_server.nice_value = 0;
-    window_server.state = 'S';
-    window_server.core_mix = "P:70% E:30%";
-
-    monitor::ProcessSnapshot code_renderer = window_server;
-    code_renderer.pid = 81325;
-    code_renderer.name = "Code Helper";
-    code_renderer.command = "/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper";
-    code_renderer.cpu_percent = 2.4;
-    code_renderer.memory_percent = 0.5;
-    code_renderer.resident_bytes = 677ULL << 20;
-    code_renderer.total_cpu_time_ns = 234170000000ULL;
-    code_renderer.core_mix = "P:85% E:15%";
-
-    monitor::ProcessSnapshot plugin = window_server;
-    plugin.pid = 81421;
-    plugin.name = "Code Helper (Plugin)";
-    plugin.command = "/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)";
-    plugin.cpu_percent = 0.5;
-    plugin.memory_percent = 3.7;
-    plugin.resident_bytes = 4837ULL << 20;
-    plugin.total_cpu_time_ns = 60780000000ULL;
-    plugin.priority = 24;
-    plugin.gpu_active = true;
-    snapshot.gpu_active_pids = {plugin.pid};
-    plugin.core_mix = "S:10% P:90%";
-    plugin.io = "45K/12K";
-    plugin.power = "142";
-
-    snapshot.processes = {window_server, code_renderer, plugin};
-  }
-
-  return snapshot;
-}
-
 void destroy_windows(WindowLayout& layout) {
   if (layout.gpu) delwin(layout.gpu);
   if (layout.cpu) delwin(layout.cpu);
@@ -2349,7 +2246,8 @@ int main(int argc, char** argv) {
     config.demo_mode = true;
   }
 
-  std::unique_ptr<monitor::Sampler> sampler(monitor::create_darwin_sampler());
+  std::unique_ptr<monitor::Sampler> sampler(
+      config.demo_mode ? monitor::create_demo_sampler() : monitor::create_darwin_sampler());
   if (!sampler) {
     std::fprintf(stderr, "failed to create sampler\n");
     return 1;
@@ -2357,7 +2255,7 @@ int main(int argc, char** argv) {
 
   if (options.debug_input) {
     const std::string path = options.debug_log_path.empty()
-                                 ? "/Users/xiuranli/code/mtop/build/mtop-input-debug.log"
+                                 ? "/tmp/mtop-input-debug.log"
                                  : options.debug_log_path;
     set_input_debug_log_path(path);
   }
@@ -2396,9 +2294,6 @@ int main(int argc, char** argv) {
 
   while (running) {
     monitor::SystemSnapshot snapshot = sampler->sample();
-    if (config.demo_mode) {
-      snapshot = apply_demo_snapshot(snapshot, tick);
-    }
 
     gpu_history.push_back(snapshot.gpu_utilization_percent);
     power_history.push_back(snapshot.system_power_watts);
