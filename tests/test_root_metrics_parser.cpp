@@ -27,5 +27,25 @@ int main() {
   parsed = monitor::parse_amp_data(super_sample, true);
   assert(parsed.core_mix.at(999) == "S:60% P:40%");
   assert(parsed.power.at(999) == "18");
+
+  const std::string merged_spaces_sample =
+      "*** Running tasks ***\n"
+      "Name              ID  CPU ms/s  PCPU ms/s  Disk Read Bytes/s  Disk Write Bytes/s  Energy Impact\n"
+      "swift-build       222      100.0 75.0              4096.0 2048.0             9\n"
+      "****\n";
+  parsed = monitor::parse_amp_data(merged_spaces_sample, false);
+  assert(parsed.core_mix.at(222) == "P:75% E:25%");
+  assert(parsed.io.at(222) == "4.0K/2.0K");
+  assert(parsed.power.at(222) == "9");
+
+  const std::string missing_columns_sample =
+      "*** Running tasks ***\n"
+      "Name              PID  CPU ms/s\n"
+      "helper            333      20.0\n"
+      "****\n";
+  parsed = monitor::parse_amp_data(missing_columns_sample, false);
+  assert(parsed.core_mix.at(333) == "P:0% E:100%");
+  assert(parsed.io.find(333) == parsed.io.end());
+  assert(parsed.power.find(333) == parsed.power.end());
   return 0;
 }

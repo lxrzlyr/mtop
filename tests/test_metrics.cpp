@@ -51,6 +51,17 @@ int main() {
   conservative.swap_used_bytes = 0;
   assert(monitor::derive_memory_pressure(conservative) == monitor::MemoryPressureLevel::Normal);
 
+  monitor::SystemSnapshot compression_warn;
+  compression_warn.memory_total_bytes = 16ULL << 30;
+  compression_warn.memory_wired_bytes = 4ULL << 30;
+  compression_warn.memory_active_bytes = 8ULL << 30;
+  compression_warn.memory_inactive_bytes = 256ULL << 20;
+  compression_warn.memory_speculative_bytes = 128ULL << 20;
+  compression_warn.memory_purgeable_bytes = 128ULL << 20;
+  compression_warn.memory_compressed_bytes = 3ULL << 30;
+  compression_warn.swap_used_bytes = 0;
+  assert(monitor::derive_memory_pressure(compression_warn) == monitor::MemoryPressureLevel::Warn);
+
   assert(std::string(monitor::memory_pressure_label(monitor::MemoryPressureLevel::Unknown)) == "Unknown");
   assert(std::string(monitor::memory_pressure_label(monitor::MemoryPressureLevel::Normal)) == "Normal");
   assert(std::string(monitor::memory_pressure_label(monitor::MemoryPressureLevel::Warn)) == "Warn");

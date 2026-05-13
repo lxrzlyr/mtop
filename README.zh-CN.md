@@ -72,7 +72,7 @@ mtop --demo
 - 统一内存、swap 使用情况，以及派生出的内存压力状态
 - 支持排序、过滤、树形、搜索、选择、nice、signal 的进程主表
 - 带增强摘要信息的 GPU 利用率面板
-- 二级 `System I/O` 视图中的系统级磁盘 / 网络吞吐
+- 二级 `System I/O` 视图中的系统级 block storage、VM paging 与网络吞吐
 - 按 GPU-active 过滤的进程视图
 - 电池、启动时长、系统负载
 
@@ -87,7 +87,7 @@ root 增强模式下：
 
 二级视图与详情交互：
 
-- `System I/O`：主机级磁盘与网络吞吐
+- `System I/O`：主机级 block storage、VM paging 与网络吞吐
 - `GPU Active`：只显示 GPU-active 进程的 focused 视图
 - `Process Detail`：显示完整命令、pid/ppid、运行时、内存、mix/io/power 和 GPU 状态的弹窗
 
@@ -104,7 +104,18 @@ root 增强模式下：
 - `0B/0B` 或 `0` 表示该指标可用，但本次采样值为零
 - `n/a` 表示 root 采样已经成功，但 `powermetrics` 在本次采样里没有给这个进程提供可用值
 - `wait` 表示 root 后台采样线程还没有产出第一帧结果
+- `stale` 表示最新 root 采样失败，当前展示的是上一份成功的 root 样本
 - `root` 表示这一列需要通过 `sudo ./build/mtop` 才能获得
+
+## System I/O 语义
+
+`System I/O` 视图会区分三类主机级信号：
+
+- `Disk`：来自 IOKit block storage driver 的读 / 写字节计数
+- `Paging`：来自 Mach VM counter 的 pageins / pageouts；这是内存分页活动，不等于磁盘吞吐
+- `Net`：活跃非 loopback 网卡的收 / 发字节计数
+
+如果某类 counter 不可用，mtop 会显示 `n/a`，不会把不可用误写成 0。
 
 ## 关于 `SOC` 功耗
 
@@ -129,6 +140,7 @@ GPU 面板中的 `SOC` 并不是充电功率，也不是整机墙上取电功率
 - 参考 `nvtop` 的 GPU 曲线面板
 - 统一内存、swap 与 memory pressure 可视化
 - 二级 `System I/O` / `GPU Active` 视图
+- best-effort GPU、ANE、thermal、root process、disk、paging 与 network 指标的不可用原因
 - 进程详情弹窗
 - 默认非 root 模式
 - root 增强采样路径

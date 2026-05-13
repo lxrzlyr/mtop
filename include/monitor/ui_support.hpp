@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <string>
 
+#include "monitor/snapshot.hpp"
+
 namespace monitor {
 
 enum class ViewMode {
@@ -13,6 +15,8 @@ enum class ViewMode {
 
 const char* view_mode_label(ViewMode mode);
 ViewMode cycle_view_mode(ViewMode mode, int delta);
+const char* metric_availability_label(MetricAvailability availability);
+std::string metric_status_label(const MetricStatus& status);
 std::string format_throughput_rate(bool available, std::uint64_t bytes_per_sec);
 std::string format_throughput_pair(bool available,
                                    std::uint64_t first_bytes_per_sec,

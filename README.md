@@ -72,7 +72,7 @@ Without root:
 - unified memory, swap usage, and derived memory pressure
 - process list with sorting, filtering, tree mode, search, selection, nice, and signal actions
 - GPU utilization with richer panel summaries
-- system-level disk and network throughput in a secondary `System I/O` view
+- system-level block storage, VM paging, and network throughput in a secondary `System I/O` view
 - GPU-active filtered process view
 - battery, uptime, and load average
 
@@ -87,7 +87,7 @@ With root:
 
 Secondary views and detail interactions:
 
-- `System I/O`: host-level disk and network throughput
+- `System I/O`: host-level block storage, VM paging, and network throughput
 - `GPU Active`: focused process view filtered by GPU-active state
 - `Process Detail`: popup with full command, pid/ppid, runtime, memory, mix, io, power, and GPU state
 
@@ -104,7 +104,18 @@ These columns are best-effort and sample-window based, so they should be read wi
 - `0B/0B` or `0` means the metric was available and the sampled value was zero
 - `n/a` means root sampling succeeded, but `powermetrics` did not provide a usable value for that process in that sample
 - `wait` means root sampling has not delivered its first background sample yet
+- `stale` means the latest root sample failed, so mtop is showing the last successful root sample
 - `root` means the column requires `sudo ./build/mtop`
+
+## System I/O Semantics
+
+The `System I/O` view separates three host-level signals:
+
+- `Disk`: IOKit block storage bytes read / written across available storage drivers
+- `Paging`: VM pageins / pageouts from Mach VM counters; this is memory paging activity, not disk throughput
+- `Net`: interface byte counters across active non-loopback network interfaces
+
+If a counter is unavailable, mtop shows `n/a` instead of treating the value as zero.
 
 ## A Note About `SOC` Power
 
@@ -129,6 +140,7 @@ That means:
 - GPU chart panel inspired by `nvtop`
 - unified memory, swap, and pressure visualization
 - secondary `System I/O` and `GPU Active` views
+- unavailable reasons for best-effort GPU, ANE, thermal, root process, disk, paging, and network metrics
 - process detail popup
 - non-root default mode
 - root-enhanced sampling path

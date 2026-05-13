@@ -105,6 +105,8 @@ struct ProcessViewMetrics {
 struct IoHistory {
   std::vector<double> disk_read;
   std::vector<double> disk_write;
+  std::vector<double> paging_in;
+  std::vector<double> paging_out;
   std::vector<double> net_rx;
   std::vector<double> net_tx;
 };
@@ -301,7 +303,8 @@ std::string centered_text(const std::string& text, int width) {
 }
 
 bool is_low_signal_extension_value(const std::string& text) {
-  return text == "root" || text == "wait" || text == "n/a" || text == "0" || text == "0B/0B";
+  return text == "root" || text == "wait" || text == "stale" || text == "parse" ||
+         text == "denied" || text == "n/a" || text == "0" || text == "0B/0B";
 }
 
 void draw_process_extension_cell(WINDOW* window,
@@ -640,10 +643,14 @@ void trim_history(std::vector<double>& history, std::size_t limit) {
 void append_io_history(IoHistory& history, const monitor::SystemSnapshot& snapshot, std::size_t limit) {
   history.disk_read.push_back(static_cast<double>(snapshot.disk_io.read_bytes_per_sec));
   history.disk_write.push_back(static_cast<double>(snapshot.disk_io.write_bytes_per_sec));
+  history.paging_in.push_back(static_cast<double>(snapshot.paging_io.pageins_bytes_per_sec));
+  history.paging_out.push_back(static_cast<double>(snapshot.paging_io.pageouts_bytes_per_sec));
   history.net_rx.push_back(static_cast<double>(snapshot.network_io.rx_bytes_per_sec));
   history.net_tx.push_back(static_cast<double>(snapshot.network_io.tx_bytes_per_sec));
   trim_history(history.disk_read, limit);
   trim_history(history.disk_write, limit);
+  trim_history(history.paging_in, limit);
+  trim_history(history.paging_out, limit);
   trim_history(history.net_rx, limit);
   trim_history(history.net_tx, limit);
 }
@@ -1483,23 +1490,30 @@ void draw_system_io_view(WINDOW* window,
   const std::string net_summary = monitor::format_labeled_throughput_summary(
       "Net", "RX", snapshot.network_io.rx_bytes_per_sec, "TX", snapshot.network_io.tx_bytes_per_sec,
       snapshot.network_io.available, compact);
+  const std::string paging_summary = monitor::format_labeled_throughput_summary(
+      "Paging", "IN", snapshot.paging_io.pageins_bytes_per_sec, "OUT", snapshot.paging_io.pageouts_bytes_per_sec,
+      snapshot.paging_io.available, compact);
   mvwprintw(window, 2, 2, "%s", elide_right(disk_summary, std::max(0, max_x - 4)).c_str());
-  mvwprintw(window, 3, 2, "%s", elide_right(net_summary, std::max(0, max_x - 4)).c_str());
+  mvwprintw(window, 3, 2, "%s", elide_right(paging_summary, std::max(0, max_x - 4)).c_str());
+  mvwprintw(window, 4, 2, "%s", elide_right(net_summary, std::max(0, max_x - 4)).c_str());
 
-  if (max_y < 10 || max_x < 32) {
+  if (max_y < 12 || max_x < 32) {
     return;
   }
 
-  const int plot_rows = std::max(3, (max_y - 8) / 2);
+  const int plot_rows = std::max(3, (max_y - 9) / 3);
   const int plot_cols = std::max(8, max_x - 6);
-  WINDOW* disk_plot = derwin(window, plot_rows, plot_cols, 5, 3);
-  WINDOW* net_plot = derwin(window, plot_rows, plot_cols, 5 + plot_rows, 3);
-  if (!disk_plot || !net_plot) {
+  WINDOW* disk_plot = derwin(window, plot_rows, plot_cols, 6, 3);
+  WINDOW* paging_plot = derwin(window, plot_rows, plot_cols, 6 + plot_rows, 3);
+  WINDOW* net_plot = derwin(window, plot_rows, plot_cols, 6 + plot_rows * 2, 3);
+  if (!disk_plot || !paging_plot || !net_plot) {
     if (disk_plot) delwin(disk_plot);
+    if (paging_plot) delwin(paging_plot);
     if (net_plot) delwin(net_plot);
     return;
   }
   werase(disk_plot);
+  werase(paging_plot);
   werase(net_plot);
 
   std::vector<double> plot_data;
@@ -1513,12 +1527,19 @@ void draw_system_io_view(WINDOW* window,
   nvtop_line_plot_port(disk_plot, plot_data.size(), plot_data.data(), 2, true, legend);
   wnoutrefresh(disk_plot);
 
+  populate_nvtop_plot_data(history.paging_in, history.paging_out, refresh_ms, plot_cols, plot_data, visible_seconds, plot_cols_used);
+  std::snprintf(legend[0], sizeof(legend[0]), "  Page in");
+  std::snprintf(legend[1], sizeof(legend[1]), "  Page out");
+  nvtop_line_plot_port(paging_plot, plot_data.size(), plot_data.data(), 2, true, legend);
+  wnoutrefresh(paging_plot);
+
   populate_nvtop_plot_data(history.net_rx, history.net_tx, refresh_ms, plot_cols, plot_data, visible_seconds, plot_cols_used);
   std::snprintf(legend[0], sizeof(legend[0]), "  Net rx");
   std::snprintf(legend[1], sizeof(legend[1]), "  Net tx");
   nvtop_line_plot_port(net_plot, plot_data.size(), plot_data.data(), 2, true, legend);
   wnoutrefresh(net_plot);
   delwin(disk_plot);
+  delwin(paging_plot);
   delwin(net_plot);
 }
 
@@ -1581,8 +1602,9 @@ void draw_gpu_active_view(WINDOW* window,
 }
 
 void draw_process_detail_popup(const WindowLayout& layout,
-                               const monitor::ProcessSnapshot& process) {
-  const int height = 13;
+                               const monitor::ProcessSnapshot& process,
+                               const monitor::SystemSnapshot& snapshot) {
+  const int height = 15;
   const int width = std::min(88, layout.cols - 4);
   const int y = std::max(1, (layout.rows - height) / 2);
   const int x = std::max(2, (layout.cols - width) / 2);
@@ -1607,6 +1629,12 @@ void draw_process_detail_popup(const WindowLayout& layout,
                          "  PWR " + process.power),
                         std::max(0, width - 6)).c_str());
   mvwprintw(popup, 9, 3, "GPU     : %s", process.gpu_active ? "active" : "n/a");
+  mvwprintw(popup, 10, 3, "%s",
+            elide_right("Root    : " + monitor::metric_status_label(snapshot.capabilities.root_process_status),
+                        std::max(0, width - 6)).c_str());
+  mvwprintw(popup, 11, 3, "%s",
+            elide_right("GPU stat: " + monitor::metric_status_label(snapshot.capabilities.gpu_per_process_status),
+                        std::max(0, width - 6)).c_str());
   mvwhline(popup, height - 2, 1, ACS_HLINE, width - 2);
   mvwprintw(popup, height - 1, 3, "Enter / Esc / d to close");
   wnoutrefresh(popup);
@@ -2169,11 +2197,26 @@ monitor::SystemSnapshot apply_demo_snapshot(monitor::SystemSnapshot snapshot, in
   snapshot.gpu_memory_used_bytes = static_cast<std::uint64_t>(
       (5.0 + 2.0 * std::max(0.0, std::sin(static_cast<double>(tick) / 6.0))) * 1024.0 * 1024.0 * 1024.0);
   snapshot.disk_io.available = true;
+  snapshot.disk_io.status.availability = monitor::MetricAvailability::Available;
+  snapshot.disk_io.status.reason = "demo block storage counters";
   snapshot.disk_io.read_bytes_per_sec = static_cast<std::uint64_t>(2.5 * 1024.0 * 1024.0 * std::max(0.0, 1.0 + std::sin(static_cast<double>(tick) / 7.0)));
   snapshot.disk_io.write_bytes_per_sec = static_cast<std::uint64_t>(1.2 * 1024.0 * 1024.0 * std::max(0.0, 1.0 + std::cos(static_cast<double>(tick) / 8.0)));
+  snapshot.paging_io.available = true;
+  snapshot.paging_io.status.availability = monitor::MetricAvailability::Available;
+  snapshot.paging_io.status.reason = "demo VM page activity";
+  snapshot.paging_io.pageins_bytes_per_sec = static_cast<std::uint64_t>(128.0 * 1024.0 * std::max(0.0, 1.0 + std::sin(static_cast<double>(tick) / 11.0)));
+  snapshot.paging_io.pageouts_bytes_per_sec = static_cast<std::uint64_t>(64.0 * 1024.0 * std::max(0.0, 1.0 + std::cos(static_cast<double>(tick) / 12.0)));
   snapshot.network_io.available = true;
+  snapshot.network_io.status.availability = monitor::MetricAvailability::Available;
+  snapshot.network_io.status.reason = "demo network counters";
   snapshot.network_io.rx_bytes_per_sec = static_cast<std::uint64_t>(6.0 * 1024.0 * 1024.0 * std::max(0.0, 0.5 + std::sin(static_cast<double>(tick) / 9.0)));
   snapshot.network_io.tx_bytes_per_sec = static_cast<std::uint64_t>(1.5 * 1024.0 * 1024.0 * std::max(0.0, 0.5 + std::cos(static_cast<double>(tick) / 10.0)));
+  snapshot.capabilities.root_process_status.availability = monitor::MetricAvailability::RequiresRoot;
+  snapshot.capabilities.root_process_status.reason = "demo non-root mode";
+  snapshot.capabilities.gpu_total_status.availability = monitor::MetricAvailability::Available;
+  snapshot.capabilities.gpu_total_status.reason = "demo GPU counters";
+  snapshot.capabilities.gpu_per_process_status.availability = monitor::MetricAvailability::Available;
+  snapshot.capabilities.gpu_per_process_status.reason = "demo active PID list";
   for (std::size_t i = 0; i < snapshot.cpu_cores.size(); ++i) {
     const double base = 10.0 + (i % 6) * 8.0;
     snapshot.cpu_cores[i].utilization_percent =
@@ -2233,6 +2276,7 @@ monitor::SystemSnapshot apply_demo_snapshot(monitor::SystemSnapshot snapshot, in
     plugin.total_cpu_time_ns = 60780000000ULL;
     plugin.priority = 24;
     plugin.gpu_active = true;
+    snapshot.gpu_active_pids = {plugin.pid};
     plugin.core_mix = "S:10% P:90%";
     plugin.io = "45K/12K";
     plugin.power = "142";
@@ -2401,7 +2445,7 @@ int main(int argc, char** argv) {
       draw_setup_popup(layout, state, config);
     } else if (state.show_process_detail) {
       if (const auto* process = selected_process(process_rows, state)) {
-        draw_process_detail_popup(layout, *process);
+        draw_process_detail_popup(layout, *process, snapshot);
       } else {
         state.show_process_detail = false;
       }

@@ -15,6 +15,15 @@ int main() {
   assert(monitor::cycle_view_mode(ViewMode::GpuActive, 1) == ViewMode::Overview);
   assert(monitor::cycle_view_mode(ViewMode::Overview, -1) == ViewMode::GpuActive);
 
+  monitor::MetricStatus status;
+  status.availability = monitor::MetricAvailability::RequiresRoot;
+  status.reason = "powermetrics required";
+  assert(std::string(monitor::metric_availability_label(status.availability)) == "root");
+  assert(monitor::metric_status_label(status) == "root: powermetrics required");
+  status.reason.clear();
+  status.availability = monitor::MetricAvailability::Stale;
+  assert(monitor::metric_status_label(status) == "stale");
+
   assert(monitor::format_throughput_rate(false, 0) == "n/a");
   assert(monitor::format_throughput_rate(true, 0) == "0B/s");
   assert(monitor::format_throughput_rate(true, 2048) == "2.0Ki/s");

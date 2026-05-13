@@ -4,9 +4,11 @@
 #include "monitor/root_metrics_parser.hpp"
 
 #include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
 #include <ifaddrs.h>
 #include <IOKit/ps/IOPowerSources.h>
 #include <IOKit/ps/IOPSKeys.h>
+#include <IOKit/storage/IOBlockStorageDriver.h>
 #include <libproc.h>
 #include <mach/mach.h>
 #include <mach/processor_info.h>
@@ -19,6 +21,7 @@
 #include <sys/sysctl.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -80,14 +83,35 @@ std::uint64_t current_uptime_seconds() {
   return now > boot_time.tv_sec ? static_cast<std::uint64_t>(now - boot_time.tv_sec) : 0;
 }
 
-std::string run_command_capture(const std::vector<std::string>& args, bool discard_stderr) {
+std::uint64_t steady_age_ms(std::chrono::steady_clock::time_point then) {
+  if (then.time_since_epoch().count() == 0) {
+    return 0;
+  }
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - then).count());
+}
+
+struct CommandResult {
+  bool ok = false;
+  bool timed_out = false;
+  int exit_code = -1;
+  std::string output;
+  std::string reason;
+};
+
+CommandResult run_command_capture_result(const std::vector<std::string>& args,
+                                         bool discard_stderr,
+                                         std::chrono::milliseconds timeout) {
+  CommandResult result;
   if (args.empty()) {
-    return "";
+    result.reason = "empty command";
+    return result;
   }
 
   int pipe_fds[2] = {-1, -1};
   if (pipe(pipe_fds) != 0) {
-    return "";
+    result.reason = std::strerror(errno);
+    return result;
   }
 
   posix_spawn_file_actions_t actions;
@@ -124,60 +148,89 @@ std::string run_command_capture(const std::vector<std::string>& args, bool disca
   close(pipe_fds[1]);
   if (spawn_rc != 0) {
     close(pipe_fds[0]);
-    return "";
+    result.reason = spawn_rc == EACCES ? "permission denied" : std::strerror(spawn_rc);
+    return result;
   }
 
-  std::string output;
+  const int flags = fcntl(pipe_fds[0], F_GETFL, 0);
+  if (flags >= 0) {
+    fcntl(pipe_fds[0], F_SETFL, flags | O_NONBLOCK);
+  }
+
   std::array<char, 4096> buffer{};
+  int status = 0;
+  bool child_done = false;
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (true) {
+    ssize_t bytes = 0;
+    while ((bytes = read(pipe_fds[0], buffer.data(), buffer.size())) > 0) {
+      result.output.append(buffer.data(), static_cast<std::size_t>(bytes));
+    }
+    if (bytes == 0) {
+      child_done = true;
+    }
+
+    const pid_t wait_rc = waitpid(pid, &status, WNOHANG);
+    if (wait_rc == pid) {
+      child_done = true;
+      break;
+    }
+    if (wait_rc < 0) {
+      result.reason = std::strerror(errno);
+      break;
+    }
+    if (child_done) {
+      break;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      result.timed_out = true;
+      result.reason = "timeout";
+      kill(pid, SIGTERM);
+      for (int i = 0; i < 10; ++i) {
+        if (waitpid(pid, &status, WNOHANG) == pid) {
+          child_done = true;
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      }
+      if (!child_done) {
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, 0);
+      }
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+
   ssize_t bytes = 0;
   while ((bytes = read(pipe_fds[0], buffer.data(), buffer.size())) > 0) {
-    output.append(buffer.data(), static_cast<std::size_t>(bytes));
+    result.output.append(buffer.data(), static_cast<std::size_t>(bytes));
   }
   close(pipe_fds[0]);
-  int status = 0;
-  waitpid(pid, &status, 0);
-  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-    return "";
+  if (result.timed_out) {
+    return result;
   }
-  return output;
+  if (!WIFEXITED(status)) {
+    result.reason = "terminated";
+    return result;
+  }
+  result.exit_code = WEXITSTATUS(status);
+  if (result.exit_code != 0) {
+    result.reason = result.exit_code == 1 ? "command failed" : "exit " + std::to_string(result.exit_code);
+    return result;
+  }
+  result.ok = true;
+  return result;
 }
 
-bool run_command_quiet(const std::vector<std::string>& args) {
-  if (args.empty()) {
-    return false;
-  }
+std::string run_command_capture(const std::vector<std::string>& args, bool discard_stderr) {
+  CommandResult result = run_command_capture_result(args, discard_stderr, std::chrono::milliseconds(5000));
+  return result.ok ? result.output : "";
+}
 
-  posix_spawn_file_actions_t actions;
-  posix_spawn_file_actions_init(&actions);
-  const int devnull_fd = open("/dev/null", O_WRONLY);
-  if (devnull_fd >= 0) {
-    posix_spawn_file_actions_adddup2(&actions, devnull_fd, STDOUT_FILENO);
-    posix_spawn_file_actions_adddup2(&actions, devnull_fd, STDERR_FILENO);
-    posix_spawn_file_actions_addclose(&actions, devnull_fd);
-  }
-
-  std::vector<char*> argv;
-  argv.reserve(args.size() + 1);
-  for (const auto& arg : args) {
-    argv.push_back(const_cast<char*>(arg.c_str()));
-  }
-  argv.push_back(nullptr);
-
-  static char path_env[] = "PATH=/usr/bin:/bin:/usr/sbin:/sbin";
-  static char lang_env[] = "LANG=C";
-  static char lc_all_env[] = "LC_ALL=C";
-  char* const safe_env[] = {path_env, lang_env, lc_all_env, nullptr};
-
-  pid_t pid = 0;
-  const int spawn_rc = posix_spawn(&pid, args[0].c_str(), &actions, nullptr, argv.data(), safe_env);
-  posix_spawn_file_actions_destroy(&actions);
-  if (devnull_fd >= 0) close(devnull_fd);
-  if (spawn_rc != 0) {
-    return false;
-  }
-  int status = 0;
-  waitpid(pid, &status, 0);
-  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+CommandResult run_command_quiet_result(const std::vector<std::string>& args,
+                                       std::chrono::milliseconds timeout) {
+  return run_command_capture_result(args, true, timeout);
 }
 
 int gpu_core_count() {
@@ -357,6 +410,9 @@ struct RootMetrics {
   bool sampled = false;
   bool available = false;
   bool ane_available = false;
+  bool stale = false;
+  std::string failure_reason;
+  std::chrono::steady_clock::time_point sample_time{};
   std::string thermal = "N/A";
   std::string ane = "N/A";
   double cpu_power_watts = 0.0;
@@ -375,6 +431,66 @@ struct HostNetworkCounters {
   std::uint64_t tx_bytes = 0;
   bool available = false;
 };
+
+struct HostDiskCounters {
+  std::uint64_t read_bytes = 0;
+  std::uint64_t write_bytes = 0;
+  bool available = false;
+  std::string failure_reason;
+};
+
+std::uint64_t cf_number_u64(CFTypeRef value) {
+  if (!value || CFGetTypeID(value) != CFNumberGetTypeID()) {
+    return 0;
+  }
+  std::uint64_t result = 0;
+  CFNumberGetValue(static_cast<CFNumberRef>(value), kCFNumberSInt64Type, &result);
+  return result;
+}
+
+std::optional<HostDiskCounters> sample_host_disk_counters() {
+  HostDiskCounters counters;
+  CFMutableDictionaryRef match = IOServiceMatching(kIOBlockStorageDriverClass);
+  if (!match) {
+    counters.failure_reason = "IOServiceMatching failed";
+    return counters;
+  }
+
+  io_iterator_t iterator = IO_OBJECT_NULL;
+  const kern_return_t rc = IOServiceGetMatchingServices(kIOMainPortDefault, match, &iterator);
+  if (rc != KERN_SUCCESS) {
+    counters.failure_reason = "IOServiceGetMatchingServices failed";
+    return counters;
+  }
+
+  io_object_t service = IO_OBJECT_NULL;
+  while ((service = IOIteratorNext(iterator)) != IO_OBJECT_NULL) {
+    CFTypeRef stats_ref = IORegistryEntryCreateCFProperty(service,
+                                                          CFSTR(kIOBlockStorageDriverStatisticsKey),
+                                                          kCFAllocatorDefault,
+                                                          0);
+    if (stats_ref && CFGetTypeID(stats_ref) == CFDictionaryGetTypeID()) {
+      CFDictionaryRef stats = static_cast<CFDictionaryRef>(stats_ref);
+      const std::uint64_t read = cf_number_u64(CFDictionaryGetValue(stats, CFSTR(kIOBlockStorageDriverStatisticsBytesReadKey)));
+      const std::uint64_t written = cf_number_u64(CFDictionaryGetValue(stats, CFSTR(kIOBlockStorageDriverStatisticsBytesWrittenKey)));
+      if (read > 0 || written > 0) {
+        counters.read_bytes += read;
+        counters.write_bytes += written;
+        counters.available = true;
+      }
+    }
+    if (stats_ref) {
+      CFRelease(stats_ref);
+    }
+    IOObjectRelease(service);
+  }
+  IOObjectRelease(iterator);
+
+  if (!counters.available) {
+    counters.failure_reason = "no block storage counters";
+  }
+  return counters;
+}
 
 std::optional<HostNetworkCounters> sample_host_network_counters() {
   ifaddrs* interfaces = nullptr;
@@ -398,6 +514,16 @@ std::optional<HostNetworkCounters> sample_host_network_counters() {
 
   freeifaddrs(interfaces);
   return counters.available ? std::optional<HostNetworkCounters>(counters) : std::nullopt;
+}
+
+MetricStatus metric_status(MetricAvailability availability,
+                           std::string reason,
+                           std::uint64_t age_ms = 0) {
+  MetricStatus status;
+  status.availability = availability;
+  status.reason = std::move(reason);
+  status.age_ms = age_ms;
+  return status;
 }
 
 class DarwinSampler final : public Sampler {
@@ -453,6 +579,12 @@ class DarwinSampler final : public Sampler {
   }
 
   void sample_memory() {
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed_seconds = last_memory_sample_time_.time_since_epoch().count() == 0
+                                       ? 0.0
+                                       : std::chrono::duration<double>(now - last_memory_sample_time_).count();
+    last_memory_sample_time_ = now;
+
     mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
     vm_statistics64_data_t vm_stat{};
     if (host_statistics64(mach_host_self(), HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vm_stat), &count) == KERN_SUCCESS) {
@@ -468,6 +600,17 @@ class DarwinSampler final : public Sampler {
       snapshot_.memory_purgeable_bytes = vm_stat.purgeable_count * static_cast<std::uint64_t>(page_size);
       snapshot_.memory_compressed_bytes = vm_stat.compressor_page_count * static_cast<std::uint64_t>(page_size);
       snapshot_.memory_inactive_bytes = vm_stat.inactive_count * static_cast<std::uint64_t>(page_size);
+      const std::uint64_t cumulative_swapins = vm_stat.swapins * static_cast<std::uint64_t>(page_size);
+      const std::uint64_t cumulative_swapouts = vm_stat.swapouts * static_cast<std::uint64_t>(page_size);
+      if (elapsed_seconds > 0.0 && previous_swapins_bytes_.has_value() && previous_swapouts_bytes_.has_value() &&
+          cumulative_swapins >= *previous_swapins_bytes_ && cumulative_swapouts >= *previous_swapouts_bytes_) {
+        snapshot_.swapins_bytes_per_sec = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(cumulative_swapins - *previous_swapins_bytes_) / elapsed_seconds));
+        snapshot_.swapouts_bytes_per_sec = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(cumulative_swapouts - *previous_swapouts_bytes_) / elapsed_seconds));
+      }
+      previous_swapins_bytes_ = cumulative_swapins;
+      previous_swapouts_bytes_ = cumulative_swapouts;
     }
     xsw_usage swap{};
     size_t size = sizeof(swap);
@@ -476,6 +619,8 @@ class DarwinSampler final : public Sampler {
       snapshot_.swap_used_bytes = swap.xsu_used;
     }
     snapshot_.memory_pressure = derive_memory_pressure(snapshot_);
+    snapshot_.memory_pressure_status = metric_status(MetricAvailability::Available,
+                                                     "derived from VM compression, reclaimable memory, and swap");
     snapshot_.swap_history_bytes.push_back(snapshot_.swap_used_bytes);
     constexpr std::size_t kSwapHistoryLimit = 60;
     if (snapshot_.swap_history_bytes.size() > kSwapHistoryLimit) {
@@ -495,27 +640,56 @@ class DarwinSampler final : public Sampler {
     snapshot_.disk_io.available = false;
     snapshot_.disk_io.read_bytes_per_sec = 0;
     snapshot_.disk_io.write_bytes_per_sec = 0;
+    snapshot_.disk_io.status = metric_status(MetricAvailability::Waiting, "waiting for second block storage sample");
+    snapshot_.paging_io.available = false;
+    snapshot_.paging_io.pageins_bytes_per_sec = 0;
+    snapshot_.paging_io.pageouts_bytes_per_sec = 0;
+    snapshot_.paging_io.swapins_bytes_per_sec = snapshot_.swapins_bytes_per_sec;
+    snapshot_.paging_io.swapouts_bytes_per_sec = snapshot_.swapouts_bytes_per_sec;
+    snapshot_.paging_io.status = metric_status(MetricAvailability::Waiting, "waiting for second VM sample");
     snapshot_.network_io.available = false;
     snapshot_.network_io.rx_bytes_per_sec = 0;
     snapshot_.network_io.tx_bytes_per_sec = 0;
+    snapshot_.network_io.status = metric_status(MetricAvailability::Waiting, "waiting for second network sample");
 
     mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
     vm_statistics64_data_t vm_stat{};
     if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
                           reinterpret_cast<host_info64_t>(&vm_stat), &count) == KERN_SUCCESS) {
       const std::uint64_t page_size = static_cast<std::uint64_t>(sysctl_scalar<int>("hw.pagesize").value_or(16384));
-      const std::uint64_t cumulative_read_bytes = vm_stat.pageins * page_size;
-      const std::uint64_t cumulative_write_bytes = vm_stat.pageouts * page_size;
-      if (elapsed_seconds > 0.0 && previous_disk_read_bytes_.has_value() && previous_disk_write_bytes_.has_value() &&
-          cumulative_read_bytes >= *previous_disk_read_bytes_ && cumulative_write_bytes >= *previous_disk_write_bytes_) {
+      const std::uint64_t cumulative_pageins_bytes = vm_stat.pageins * page_size;
+      const std::uint64_t cumulative_pageouts_bytes = vm_stat.pageouts * page_size;
+      if (elapsed_seconds > 0.0 && previous_pageins_bytes_.has_value() && previous_pageouts_bytes_.has_value() &&
+          cumulative_pageins_bytes >= *previous_pageins_bytes_ && cumulative_pageouts_bytes >= *previous_pageouts_bytes_) {
+        snapshot_.paging_io.available = true;
+        snapshot_.paging_io.pageins_bytes_per_sec = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(cumulative_pageins_bytes - *previous_pageins_bytes_) / elapsed_seconds));
+        snapshot_.paging_io.pageouts_bytes_per_sec = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(cumulative_pageouts_bytes - *previous_pageouts_bytes_) / elapsed_seconds));
+        snapshot_.paging_io.status = metric_status(MetricAvailability::Available, "VM page activity, not block device throughput");
+      }
+      previous_pageins_bytes_ = cumulative_pageins_bytes;
+      previous_pageouts_bytes_ = cumulative_pageouts_bytes;
+    } else {
+      snapshot_.paging_io.status = metric_status(MetricAvailability::Unavailable, "host_statistics64 failed");
+    }
+
+    const std::optional<HostDiskCounters> disk_counters = sample_host_disk_counters();
+    if (disk_counters.has_value()) {
+      if (disk_counters->available && elapsed_seconds > 0.0 && previous_disk_read_bytes_.has_value() &&
+          previous_disk_write_bytes_.has_value() && disk_counters->read_bytes >= *previous_disk_read_bytes_ &&
+          disk_counters->write_bytes >= *previous_disk_write_bytes_) {
         snapshot_.disk_io.available = true;
         snapshot_.disk_io.read_bytes_per_sec = static_cast<std::uint64_t>(
-            std::llround(static_cast<double>(cumulative_read_bytes - *previous_disk_read_bytes_) / elapsed_seconds));
+            std::llround(static_cast<double>(disk_counters->read_bytes - *previous_disk_read_bytes_) / elapsed_seconds));
         snapshot_.disk_io.write_bytes_per_sec = static_cast<std::uint64_t>(
-            std::llround(static_cast<double>(cumulative_write_bytes - *previous_disk_write_bytes_) / elapsed_seconds));
+            std::llround(static_cast<double>(disk_counters->write_bytes - *previous_disk_write_bytes_) / elapsed_seconds));
+        snapshot_.disk_io.status = metric_status(MetricAvailability::Available, "IOKit block storage counters");
+      } else if (!disk_counters->available) {
+        snapshot_.disk_io.status = metric_status(MetricAvailability::Unavailable, disk_counters->failure_reason);
       }
-      previous_disk_read_bytes_ = cumulative_read_bytes;
-      previous_disk_write_bytes_ = cumulative_write_bytes;
+      previous_disk_read_bytes_ = disk_counters->read_bytes;
+      previous_disk_write_bytes_ = disk_counters->write_bytes;
     }
 
     const std::optional<HostNetworkCounters> network_counters = sample_host_network_counters();
@@ -528,9 +702,12 @@ class DarwinSampler final : public Sampler {
             std::llround(static_cast<double>(network_counters->rx_bytes - *previous_network_rx_bytes_) / elapsed_seconds));
         snapshot_.network_io.tx_bytes_per_sec = static_cast<std::uint64_t>(
             std::llround(static_cast<double>(network_counters->tx_bytes - *previous_network_tx_bytes_) / elapsed_seconds));
+        snapshot_.network_io.status = metric_status(MetricAvailability::Available, "interface byte counters");
       }
       previous_network_rx_bytes_ = network_counters->rx_bytes;
       previous_network_tx_bytes_ = network_counters->tx_bytes;
+    } else {
+      snapshot_.network_io.status = metric_status(MetricAvailability::Unavailable, "no active network interface counters");
     }
   }
 
@@ -543,12 +720,20 @@ class DarwinSampler final : public Sampler {
     const AppleGpuProbeResult probe = sample_apple_gpu();
     snapshot_.capabilities.gpu_total_available = probe.available;
     snapshot_.capabilities.gpu_per_process_available = !probe.active_pids.empty();
+    snapshot_.capabilities.gpu_total_status = probe.available
+        ? metric_status(MetricAvailability::Available, "Apple GPU user-mode counters")
+        : metric_status(MetricAvailability::Unavailable, "Apple GPU counters unavailable");
+    snapshot_.capabilities.gpu_per_process_status = !probe.active_pids.empty()
+        ? metric_status(MetricAvailability::Available, "active PID list from Apple GPU counters")
+        : metric_status(MetricAvailability::Unavailable, "no active GPU PID list in current sample");
     snapshot_.gpu_utilization_percent = probe.utilization_percent;
     snapshot_.gpu_memory_used_bytes = probe.used_memory_bytes;
     snapshot_.gpu_memory_total_bytes = probe.total_memory_bytes;
     gpu_active_pid_set_.clear();
+    snapshot_.gpu_active_pids.clear();
     for (int pid : probe.active_pids) {
       gpu_active_pid_set_.insert(pid);
+      snapshot_.gpu_active_pids.push_back(pid);
     }
     if (!probe.available) {
       snapshot_.gpu_summary = "N/A without root";
@@ -745,6 +930,11 @@ class DarwinSampler final : public Sampler {
       process.io = io_it != cached_root_metrics_.process_io.end() ? io_it->second : missing_root_detail;
       auto power_it = cached_root_metrics_.process_power.find(pid);
       process.power = power_it != cached_root_metrics_.process_power.end() ? power_it->second : missing_root_detail;
+      if (snapshot_.capabilities.root_process_status.availability == MetricAvailability::Stale) {
+        if (core_mix_it == cached_root_metrics_.process_core_mix.end()) process.core_mix = "stale";
+        if (io_it == cached_root_metrics_.process_io.end()) process.io = "stale";
+        if (power_it == cached_root_metrics_.process_power.end()) process.power = "stale";
+      }
       processes.push_back(process);
     }
 
@@ -768,6 +958,9 @@ class DarwinSampler final : public Sampler {
       snapshot_.ane = "N/A without root";
       snapshot_.capabilities.thermal_available = false;
       snapshot_.capabilities.ane_available = false;
+      snapshot_.capabilities.thermal_status = metric_status(MetricAvailability::RequiresRoot, "powermetrics requires root");
+      snapshot_.capabilities.ane_status = metric_status(MetricAvailability::RequiresRoot, "powermetrics requires root");
+      snapshot_.capabilities.root_process_status = metric_status(MetricAvailability::RequiresRoot, "powermetrics requires root");
       return;
     }
 
@@ -784,30 +977,58 @@ class DarwinSampler final : public Sampler {
       snapshot_.ane = cached_root_metrics_.ane_available ? cached_root_metrics_.ane : "N/A";
       snapshot_.capabilities.thermal_available = true;
       snapshot_.capabilities.ane_available = cached_root_metrics_.ane_available;
+      const MetricAvailability availability = cached_root_metrics_.stale ? MetricAvailability::Stale : MetricAvailability::Available;
+      const std::uint64_t age_ms = steady_age_ms(cached_root_metrics_.sample_time);
+      snapshot_.capabilities.thermal_status = metric_status(availability,
+                                                            cached_root_metrics_.stale ? cached_root_metrics_.failure_reason : "powermetrics thermal sampler",
+                                                            age_ms);
+      snapshot_.capabilities.ane_status = cached_root_metrics_.ane_available
+          ? metric_status(availability,
+                          cached_root_metrics_.stale ? cached_root_metrics_.failure_reason : "powermetrics ANE sampler",
+                          age_ms)
+          : metric_status(MetricAvailability::Unavailable, "ANE field missing from powermetrics", age_ms);
+      snapshot_.capabilities.root_process_status = metric_status(availability,
+                                                                 cached_root_metrics_.stale ? cached_root_metrics_.failure_reason : "powermetrics task sampler",
+                                                                 age_ms);
     } else {
       snapshot_.thermal = "N/A";
       snapshot_.ane = "N/A";
       snapshot_.capabilities.thermal_available = false;
       snapshot_.capabilities.ane_available = false;
+      const MetricAvailability availability = cached_root_metrics_.sampled
+          ? (cached_root_metrics_.failure_reason.find("permission") != std::string::npos
+                 ? MetricAvailability::PermissionDenied
+                 : cached_root_metrics_.failure_reason.find("parse") != std::string::npos
+                       ? MetricAvailability::ParseFailed
+                       : MetricAvailability::Unavailable)
+          : MetricAvailability::Waiting;
+      const std::string reason = cached_root_metrics_.sampled ? cached_root_metrics_.failure_reason : "waiting for first powermetrics sample";
+      snapshot_.capabilities.thermal_status = metric_status(availability, reason);
+      snapshot_.capabilities.ane_status = metric_status(availability, reason);
+      snapshot_.capabilities.root_process_status = metric_status(availability, reason);
     }
   }
 
   RootMetrics collect_root_metrics() {
     RootMetrics metrics;
     metrics.sampled = true;
+    metrics.sample_time = std::chrono::steady_clock::now();
     char plist_template[] = "/tmp/mtop-powermetrics-XXXXXX";
     int fd = mkstemp(plist_template);
     if (fd >= 0) {
       close(fd);
-      const bool rc = run_command_quiet({
+      const CommandResult plist_result = run_command_quiet_result({
           "/usr/bin/powermetrics",
           "--samplers", "cpu_power,gpu_power,thermal,ane_power",
           "-n", "1",
           "-i", "1000",
           "-f", "plist",
           "-o", plist_template,
-      });
-      if (rc) {
+      }, std::chrono::milliseconds(3500));
+      if (!plist_result.ok) {
+        metrics.failure_reason = plist_result.reason.empty() ? "powermetrics plist failed" : plist_result.reason;
+      }
+      if (plist_result.ok) {
         std::ifstream input(plist_template, std::ios::binary);
         std::vector<char> bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
         if (!bytes.empty()) {
@@ -896,6 +1117,8 @@ class DarwinSampler final : public Sampler {
         }
       }
       std::remove(plist_template);
+    } else {
+      metrics.failure_reason = "temporary file failed";
     }
 
     const bool has_super = [&] {
@@ -904,7 +1127,7 @@ class DarwinSampler final : public Sampler {
       }
       return false;
     }();
-    const std::string amp_text = run_command_capture({
+    const CommandResult amp_result = run_command_capture_result({
         "/usr/bin/powermetrics",
         "--samplers", "tasks,cpu_power,disk",
         "--show-process-amp",
@@ -913,34 +1136,54 @@ class DarwinSampler final : public Sampler {
         "--show-process-ipc",
         "-n", "1",
         "-i", "1000",
-    }, true);
-    AmpData amp = parse_amp_data(amp_text, has_super);
+    }, true, std::chrono::milliseconds(3500));
+    if (!amp_result.ok && metrics.failure_reason.empty()) {
+      metrics.failure_reason = amp_result.reason.empty() ? "powermetrics task sampler failed" : amp_result.reason;
+    }
+    AmpData amp = parse_amp_data(amp_result.output, has_super);
     if (amp.core_mix.empty() && amp.io.empty() && amp.power.empty()) {
-      AmpData fallback = parse_amp_data(run_command_capture({
+      const CommandResult fallback_result = run_command_capture_result({
           "/usr/bin/powermetrics",
           "--samplers", "tasks,cpu_power",
           "--show-process-amp",
           "--show-process-energy",
           "-n", "1",
           "-i", "1000",
-      }, true), has_super);
+      }, true, std::chrono::milliseconds(3500));
+      AmpData fallback = parse_amp_data(fallback_result.output, has_super);
       if (amp.core_mix.empty()) amp.core_mix = std::move(fallback.core_mix);
       if (amp.power.empty()) amp.power = std::move(fallback.power);
+      if (!fallback_result.ok && metrics.failure_reason.empty()) {
+        metrics.failure_reason = fallback_result.reason.empty() ? "powermetrics task fallback failed" : fallback_result.reason;
+      }
     }
     metrics.process_core_mix = std::move(amp.core_mix);
     metrics.process_io = std::move(amp.io);
     metrics.process_power = std::move(amp.power);
+    if (!metrics.available && metrics.failure_reason.empty()) {
+      metrics.failure_reason = "parse failed";
+    }
     return metrics;
   }
 
   void root_metrics_loop() {
+    RootMetrics last_success;
     while (!stop_root_metrics_.load()) {
       RootMetrics metrics = collect_root_metrics();
+      if (metrics.available) {
+        last_success = metrics;
+      } else if (last_success.available) {
+        const std::string failure = metrics.failure_reason.empty() ? "powermetrics sample failed" : metrics.failure_reason;
+        metrics = last_success;
+        metrics.sampled = true;
+        metrics.stale = true;
+        metrics.failure_reason = failure;
+      }
       {
         std::lock_guard<std::mutex> lock(root_metrics_mutex_);
         shared_root_metrics_ = std::move(metrics);
       }
-      for (int i = 0; i < 10 && !stop_root_metrics_.load(); ++i) {
+      for (int i = 0; i < 5 && !stop_root_metrics_.load(); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
       }
     }
@@ -952,9 +1195,14 @@ class DarwinSampler final : public Sampler {
   natural_t previous_cpu_count_ = 0;
   std::map<pid_t, std::uint64_t> previous_process_times_{};
   std::chrono::steady_clock::time_point last_process_sample_time_{};
+  std::chrono::steady_clock::time_point last_memory_sample_time_{};
   std::chrono::steady_clock::time_point last_io_sample_time_{};
   std::optional<std::uint64_t> previous_disk_read_bytes_{};
   std::optional<std::uint64_t> previous_disk_write_bytes_{};
+  std::optional<std::uint64_t> previous_pageins_bytes_{};
+  std::optional<std::uint64_t> previous_pageouts_bytes_{};
+  std::optional<std::uint64_t> previous_swapins_bytes_{};
+  std::optional<std::uint64_t> previous_swapouts_bytes_{};
   std::optional<std::uint64_t> previous_network_rx_bytes_{};
   std::optional<std::uint64_t> previous_network_tx_bytes_{};
   std::set<int> gpu_active_pid_set_{};

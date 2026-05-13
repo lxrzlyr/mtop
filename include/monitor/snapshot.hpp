@@ -13,6 +13,24 @@ enum class MemoryPressureLevel {
   Critical,
 };
 
+enum class MetricAvailability {
+  Available,
+  RequiresRoot,
+  UnsupportedHardware,
+  UnsupportedOS,
+  PermissionDenied,
+  Waiting,
+  Stale,
+  ParseFailed,
+  Unavailable,
+};
+
+struct MetricStatus {
+  MetricAvailability availability = MetricAvailability::Unavailable;
+  std::string reason;
+  std::uint64_t age_ms = 0;
+};
+
 struct BatterySnapshot {
   bool available = false;
   bool on_ac_power = false;
@@ -35,12 +53,23 @@ struct DiskIoSnapshot {
   bool available = false;
   std::uint64_t read_bytes_per_sec = 0;
   std::uint64_t write_bytes_per_sec = 0;
+  MetricStatus status;
+};
+
+struct PagingIoSnapshot {
+  bool available = false;
+  std::uint64_t pageins_bytes_per_sec = 0;
+  std::uint64_t pageouts_bytes_per_sec = 0;
+  std::uint64_t swapins_bytes_per_sec = 0;
+  std::uint64_t swapouts_bytes_per_sec = 0;
+  MetricStatus status;
 };
 
 struct NetworkIoSnapshot {
   bool available = false;
   std::uint64_t rx_bytes_per_sec = 0;
   std::uint64_t tx_bytes_per_sec = 0;
+  MetricStatus status;
 };
 
 struct CpuCoreSnapshot {
@@ -77,6 +106,11 @@ struct CapabilitySnapshot {
   bool thermal_available = false;
   bool ane_available = false;
   bool root_mode = false;
+  MetricStatus gpu_total_status;
+  MetricStatus gpu_per_process_status;
+  MetricStatus thermal_status;
+  MetricStatus ane_status;
+  MetricStatus root_process_status;
 };
 
 struct SystemSnapshot {
@@ -98,8 +132,11 @@ struct SystemSnapshot {
   std::uint64_t memory_compressed_bytes = 0;
   std::uint64_t memory_inactive_bytes = 0;
   MemoryPressureLevel memory_pressure = MemoryPressureLevel::Unknown;
+  MetricStatus memory_pressure_status;
   std::uint64_t swap_used_bytes = 0;
   std::uint64_t swap_total_bytes = 0;
+  std::uint64_t swapins_bytes_per_sec = 0;
+  std::uint64_t swapouts_bytes_per_sec = 0;
   std::vector<std::uint64_t> swap_history_bytes;
   std::uint64_t uptime_seconds = 0;
 
@@ -115,7 +152,9 @@ struct SystemSnapshot {
   int gpu_frequency_mhz = 0;
   std::uint64_t gpu_memory_used_bytes = 0;
   std::uint64_t gpu_memory_total_bytes = 0;
+  std::vector<int> gpu_active_pids;
   DiskIoSnapshot disk_io;
+  PagingIoSnapshot paging_io;
   NetworkIoSnapshot network_io;
 
   std::vector<CpuCoreSnapshot> cpu_cores;

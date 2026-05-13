@@ -60,6 +60,29 @@ ViewMode cycle_view_mode(ViewMode mode, int delta) {
   return kModes[index];
 }
 
+const char* metric_availability_label(MetricAvailability availability) {
+  switch (availability) {
+    case MetricAvailability::Available: return "ok";
+    case MetricAvailability::RequiresRoot: return "root";
+    case MetricAvailability::UnsupportedHardware: return "hw";
+    case MetricAvailability::UnsupportedOS: return "os";
+    case MetricAvailability::PermissionDenied: return "denied";
+    case MetricAvailability::Waiting: return "wait";
+    case MetricAvailability::Stale: return "stale";
+    case MetricAvailability::ParseFailed: return "parse";
+    case MetricAvailability::Unavailable: return "n/a";
+  }
+  return "n/a";
+}
+
+std::string metric_status_label(const MetricStatus& status) {
+  const std::string label = metric_availability_label(status.availability);
+  if (!status.reason.empty()) {
+    return label + ": " + status.reason;
+  }
+  return label;
+}
+
 std::string format_throughput_rate(bool available, std::uint64_t bytes_per_sec) {
   if (!available) {
     return "n/a";
