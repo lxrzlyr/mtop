@@ -8,6 +8,9 @@ enum class SortMode {
   Mem,
   Time,
   Name,
+  GpuActive,
+  Io,
+  Power,
 };
 
 struct SortState {

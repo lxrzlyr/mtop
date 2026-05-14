@@ -27,15 +27,36 @@ brew install mtop
 mtop
 ```
 
+`mtop` 默认进入 AI-first alpha profile。切换到 classic monitor profile：
+
+```bash
+mtop -view beta
+```
+
 预览模式：
 
 ```bash
 mtop --demo
+mtop --demo -view beta
+```
+
+机器可读 snapshot：
+
+```bash
+mtop --snapshot json
+mtop --snapshot json --count 10 --interval-ms 1000
+mtop --snapshot json --session --output run.jsonl --count 10
 ```
 
 ## 截图
 
-![mtop demo](./assets/mtop-demo.png)
+Alpha profile：
+
+![mtop alpha demo](./assets/mtop-alpha-demo.png)
+
+Beta profile：
+
+![mtop beta demo](./assets/mtop-beta-demo.png)
 
 ## 为什么要做这个工具
 
@@ -131,7 +152,7 @@ GPU 面板中的 `SOC` 并不是充电功率，也不是整机墙上取电功率
 
 ## 当前功能
 
-当前稳定版本：`v1.4.0`。
+当前稳定版本：`v2.0.0`。
 
 - Apple Silicon-aware CPU 面板
 - CPU cluster 摘要行
@@ -143,7 +164,9 @@ GPU 面板中的 `SOC` 并不是充电功率，也不是整机墙上取电功率
 - 统一内存、swap 与 memory pressure 可视化
 - 二级 `System I/O` / `GPU Active` 视图
 - best-effort GPU、ANE、thermal、root process、disk、paging 与 network 指标的不可用原因
-- 进程详情弹窗
+- 进程详情弹窗，并显示 root 增强指标的可用性原因
+- 面向脚本和结构化采集的 JSON snapshot 输出
+- 扩展配置项，支持默认视图、cached memory 展示、排序和 snapshot 间隔
 - 默认非 root 模式
 - root 增强采样路径
 - demo 模式
@@ -152,9 +175,7 @@ GPU 面板中的 `SOC` 并不是充电功率，也不是整机墙上取电功率
 
 ## 版本状态
 
-`v1.4.0` 是已完成的 1.4 稳定化版本。它修正了 System I/O 语义，增加了明确的 metric availability 状态，让 root 增强采样支持 timeout/stale 状态，刷新了使用合成数据的 demo 模式，并收敛了文档结构。
-
-下一个 1.x 目标是 `v1.5.0`，重点是 JSON snapshot 输出、轻量配置扩展、小范围进程表体验增强，以及为 2.0 数据模型做准备。
+`v2.0.0` 从同一份源码提供两个运行时 profile。默认的 `alpha` profile 是 AI-first，包含 workload 检测、memory risk 摘要、JSON v2 字段和 JSONL session。`beta` profile 保留 1.x 熟悉的 classic monitor UI。使用 `-view alpha` 或 `-view beta` 可以在运行时持久化切换。
 
 ## 构建
 
@@ -195,6 +216,18 @@ UI 预览模式：
 ./scripts/preview_demo.sh
 ```
 
+Snapshot 模式不会初始化 curses：
+
+```bash
+./build/mtop --snapshot json
+./build/mtop --snapshot json --loop
+./build/mtop --snapshot json --count 10 --interval-ms 1000
+./build/mtop --demo --snapshot json
+./build/mtop --demo --snapshot json --session --output /tmp/mtop-session.jsonl --count 3
+```
+
+每个 snapshot 都是完整 JSON 对象，包含 `schema_version: 2`、`view_profile`、时间戳/采样间隔、host 元数据、capability status、CPU、memory、GPU、ANE、I/O、process、`workloads` 和 `memory_risk` 字段。Session mode 写入 JSONL 事件：`session_start`、每个采样点一个 `snapshot`，以及 `session_end`。
+
 ## 操作说明
 
 主界面交互：
@@ -205,7 +238,7 @@ UI 预览模式：
 - `F5` 或 `t`：树形模式
 - `+ / - / *`：展开 / 折叠 / 切换树节点
 - `F6` 或 `>` 或 `.`：排序菜单
-- `N / P / M / T / A / I`：PID / CPU / MEM / TIME / NAME / 反转排序
+- `N / P / M / T / A / G / O / W / I`：PID / CPU / MEM / TIME / NAME / GPU-active / IO / PWR / 反转排序
 - `F7 / F8`、`Tab / Shift-Tab` 或 `{ / }`：切换前后视图
 - `] / [`：调整 nice
 - `F9` 或 `k`：发送信号
@@ -234,15 +267,26 @@ theme=apple
 refresh_ms=1000
 process_limit=12
 demo_mode=false
+root_sample_ms=1000
+snapshot_interval_ms=1000
+show_cached_memory=false
+view_profile=alpha
+default_view=overview
+sort=cpu
+sort_direction=desc
 ```
+
+`view_profile` 选择产品视图 profile（`alpha` 或 `beta`）。缺失或无效值会回落到 alpha。`-view beta` / `--view beta` 和 `-view alpha` / `--view alpha` 会立即切换并持久化所选 profile。
 
 CLI 覆盖：
 
 ```bash
 ./build/mtop --demo
+./build/mtop -view beta
 ./build/mtop --refresh-ms 500
 ./build/mtop --theme mono
 ./build/mtop --config /path/to/config
+./build/mtop --snapshot json --interval-ms 500
 ./build/mtop --debug-input
 ./build/mtop --debug-input --debug-log /tmp/mtop-input.log
 ```

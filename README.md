@@ -27,15 +27,36 @@ Run it:
 mtop
 ```
 
+`mtop` starts in the AI-first alpha profile. To use the classic monitor profile:
+
+```bash
+mtop -view beta
+```
+
 Preview mode:
 
 ```bash
 mtop --demo
+mtop --demo -view beta
 ```
 
-## Screenshot
+Machine-readable snapshot:
 
-![mtop demo](./docs/assets/mtop-demo.png)
+```bash
+mtop --snapshot json
+mtop --snapshot json --count 10 --interval-ms 1000
+mtop --snapshot json --session --output run.jsonl --count 10
+```
+
+## Screenshots
+
+Alpha profile:
+
+![mtop alpha demo](./docs/assets/mtop-alpha-demo.png)
+
+Beta profile:
+
+![mtop beta demo](./docs/assets/mtop-beta-demo.png)
 
 ## Why This Exists
 
@@ -131,7 +152,7 @@ That means:
 
 ## Current Feature Set
 
-Current stable release: `v1.4.0`.
+Current stable release: `v2.0.0`.
 
 - Apple Silicon-aware CPU panel with core-class grouping
 - compact CPU cluster summary line
@@ -143,7 +164,9 @@ Current stable release: `v1.4.0`.
 - unified memory, swap, and pressure visualization
 - secondary `System I/O` and `GPU Active` views
 - unavailable reasons for best-effort GPU, ANE, thermal, root process, disk, paging, and network metrics
-- process detail popup
+- process detail popup with root metric availability reasons
+- JSON snapshot output for scripts and structured telemetry capture
+- expanded config for default view, cached memory display, sort, and snapshot timing
 - non-root default mode
 - root-enhanced sampling path
 - demo mode for UI iteration
@@ -152,9 +175,7 @@ Current stable release: `v1.4.0`.
 
 ## Release Status
 
-`v1.4.0` is the completed 1.4 stabilization release. It corrected System I/O semantics, added explicit metric availability status, made root-enhanced sampling timeout/stale-aware, refreshed demo mode with synthetic data, and consolidated docs.
-
-The next 1.x target is `v1.5.0`, focused on JSON snapshot output, lightweight config expansion, small process-table quality-of-life improvements, and 2.0 data-model preparation.
+`v2.0.0` ships two runtime profiles from one source tree. The default `alpha` profile is AI-first and includes workload detection, memory-risk summaries, JSON v2 fields, and JSONL sessions. The `beta` profile keeps the familiar 1.x monitor UI first. Use `-view alpha` or `-view beta` to switch persistently at runtime.
 
 ## Build
 
@@ -195,6 +216,18 @@ Helper preview script:
 ./scripts/preview_demo.sh
 ```
 
+Snapshot mode does not initialize curses:
+
+```bash
+./build/mtop --snapshot json
+./build/mtop --snapshot json --loop
+./build/mtop --snapshot json --count 10 --interval-ms 1000
+./build/mtop --demo --snapshot json
+./build/mtop --demo --snapshot json --session --output /tmp/mtop-session.jsonl --count 3
+```
+
+Each snapshot is a complete JSON object with `schema_version: 2`, `view_profile`, timestamp/sample interval, host metadata, capability status, CPU, memory, GPU, ANE, I/O, process fields, `workloads`, and `memory_risk`. Session mode writes JSONL events: `session_start`, one `snapshot` event per sample, and `session_end`.
+
 ## Controls
 
 Main interaction:
@@ -205,7 +238,7 @@ Main interaction:
 - `F5` or `t`: tree mode
 - `+ / - / *`: expand / collapse / toggle tree nodes
 - `F6` or `>` or `.`: sort menu
-- `N / P / M / T / A / I`: PID / CPU / MEM / TIME / NAME / invert
+- `N / P / M / T / A / G / O / W / I`: PID / CPU / MEM / TIME / NAME / GPU-active / IO / PWR / invert
 - `F7 / F8`, `Tab / Shift-Tab`, or `{ / }`: previous / next secondary view
 - `] / [`: renice
 - `F9` or `k`: send signal
@@ -234,15 +267,26 @@ theme=apple
 refresh_ms=1000
 process_limit=12
 demo_mode=false
+root_sample_ms=1000
+snapshot_interval_ms=1000
+show_cached_memory=false
+view_profile=alpha
+default_view=overview
+sort=cpu
+sort_direction=desc
 ```
+
+`view_profile` selects the product profile (`alpha` or `beta`). Missing or invalid values fall back to alpha. `-view beta` / `--view beta` and `-view alpha` / `--view alpha` switch immediately and persist the selected profile.
 
 CLI overrides:
 
 ```bash
 ./build/mtop --demo
+./build/mtop -view beta
 ./build/mtop --refresh-ms 500
 ./build/mtop --theme mono
 ./build/mtop --config /path/to/config
+./build/mtop --snapshot json --interval-ms 500
 ./build/mtop --debug-input
 ./build/mtop --debug-input --debug-log /tmp/mtop-input.log
 ```

@@ -3,6 +3,7 @@
 #include "monitor/metrics.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -52,8 +53,18 @@ MetricStatus demo_status(MetricAvailability availability, const std::string& rea
   return status;
 }
 
+std::uint64_t unix_time_ms() {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+}
+
 SystemSnapshot make_demo_snapshot(int tick) {
   SystemSnapshot snapshot;
+  snapshot.timestamp_unix_ms = unix_time_ms();
+  snapshot.sample_interval_ms = tick == 0 ? 0 : 1000;
+  snapshot.macos_version = "macOS demo";
   snapshot.soc_name = "Apple M3 Pro";
   snapshot.cpu_core_count = 12;
   snapshot.gpu_core_count = 18;
@@ -74,11 +85,11 @@ SystemSnapshot make_demo_snapshot(int tick) {
   snapshot.load_15 = 1.86;
   snapshot.memory_total_bytes = 36ULL << 30;
   snapshot.memory_wired_bytes = 5ULL << 30;
-  snapshot.memory_active_bytes = 13ULL << 30;
+  snapshot.memory_active_bytes = 17ULL << 30;
   snapshot.memory_inactive_bytes = 6ULL << 30;
   snapshot.memory_speculative_bytes = 2ULL << 30;
   snapshot.memory_purgeable_bytes = 2ULL << 30;
-  snapshot.memory_compressed_bytes = 3ULL << 30;
+  snapshot.memory_compressed_bytes = 5ULL << 30;
   snapshot.memory_used_bytes = snapshot.memory_wired_bytes + snapshot.memory_active_bytes +
                                 snapshot.memory_compressed_bytes;
   snapshot.swap_total_bytes = 8ULL << 30;
@@ -152,16 +163,18 @@ SystemSnapshot make_demo_snapshot(int tick) {
   snapshot.memory_pressure = derive_memory_pressure(snapshot);
   snapshot.memory_pressure_status = demo_status(MetricAvailability::Available, "demo VM pressure model");
   snapshot.processes = {
-      make_process(4201, 1, "mlx-lm", "/demo/ai/mlx-lm serve --model /demo/models/mistral-7b", 64.2, 21.4, 7890ULL << 20, 918060000000ULL, true, "P:82% E:18%", "18M/3.0M", "188"),
-      make_process(4318, 4201, "python", "/demo/workloads/rag-api/.venv/bin/python /demo/workloads/rag-api/server.py", 18.6, 9.8, 3610ULL << 20, 421170000000ULL, true, "P:74% E:26%", "7.8M/1.2M", "76"),
-      make_process(4388, 4201, "node", "/demo/apps/dashboard/node_modules/.bin/vite --host 127.0.0.1", 9.3, 2.1, 774ULL << 20, 163050000000ULL, false, "P:55% E:45%", "1.1M/420K", "21"),
+      make_process(4100, 1, "ollama", "ollama serve", 4.2, 1.2, 442ULL << 20, 918060000000ULL, false, "P:42% E:58%", "820K/260K", "9"),
+      make_process(4107, 4100, "ollama", "ollama runner --model llama3.1:8b --ctx-size 8192", 138.0, 27.4, 10100ULL << 20, 762450000000ULL, true, "P:88% E:12%", "32M/5.0M", "188"),
+      make_process(4201, 1, "mlx-lm", "python -m mlx_lm.server --model /demo/models/mistral-7b", 64.2, 21.4, 7890ULL << 20, 918060000000ULL, true, "P:82% E:18%", "18M/3.0M", "76"),
+      make_process(4318, 1, "uvicorn", "/demo/workloads/rag-api/.venv/bin/uvicorn app:api --host 127.0.0.1 --port 8000", 18.6, 9.8, 3610ULL << 20, 421170000000ULL, false, "P:74% E:26%", "7.8M/1.2M", "34"),
+      make_process(4370, 1, "python", "/demo/ComfyUI/main.py --ckpt /demo/models/flux-dev.safetensors --listen", 34.2, 11.3, 4210ULL << 20, 221170000000ULL, true, "P:79% E:21%", "12M/2.5M", "42"),
+      make_process(4388, 4318, "sqlite-worker", "/demo/workloads/rag-api/bin/sqlite-worker", 1.4, 0.8, 295ULL << 20, 54120000000ULL, false, "P:28% E:72%", "92K/740K", "5"),
       make_process(4482, 1, "Xcode", "/demo/apps/Xcode.app/Contents/MacOS/Xcode", 7.8, 4.6, 1690ULL << 20, 238440000000ULL, false, "P:68% E:32%", "2.5M/980K", "34"),
       make_process(4530, 1, "WindowServer", "/demo/system/WindowServer", 5.1, 2.3, 846ULL << 20, 611220000000ULL, true, "P:61% E:39%", "820K/260K", "29"),
       make_process(4584, 1, "mtop", "/demo/tools/mtop --demo", 3.6, 0.4, 154ULL << 20, 36150000000ULL, false, "P:42% E:58%", "64K/16K", "8"),
       make_process(4622, 1, "Safari", "/demo/apps/Safari.app/Contents/MacOS/Safari", 2.9, 3.2, 1180ULL << 20, 180770000000ULL, true, "P:47% E:53%", "540K/180K", "15"),
-      make_process(4704, 4318, "sqlite-worker", "/demo/workloads/rag-api/bin/sqlite-worker", 1.4, 0.8, 295ULL << 20, 54120000000ULL, false, "P:28% E:72%", "92K/740K", "5"),
   };
-  snapshot.gpu_active_pids = {4201, 4318, 4530, 4622};
+  snapshot.gpu_active_pids = {4107, 4201, 4370, 4530, 4622};
   return snapshot;
 }
 

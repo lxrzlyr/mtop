@@ -20,6 +20,7 @@
 #include <sys/proc.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <signal.h>
 #include <unistd.h>
@@ -81,6 +82,25 @@ std::uint64_t current_uptime_seconds() {
   }
   const std::time_t now = std::time(nullptr);
   return now > boot_time.tv_sec ? static_cast<std::uint64_t>(now - boot_time.tv_sec) : 0;
+}
+
+std::uint64_t unix_time_ms() {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+}
+
+std::string macos_version_string() {
+  const std::string product_version = sysctl_string("kern.osproductversion");
+  if (!product_version.empty()) {
+    return "macOS " + product_version;
+  }
+  utsname info{};
+  if (uname(&info) == 0) {
+    return std::string("macOS ") + info.release;
+  }
+  return "macOS";
 }
 
 std::uint64_t steady_age_ms(std::chrono::steady_clock::time_point then) {
@@ -528,7 +548,8 @@ MetricStatus metric_status(MetricAvailability availability,
 
 class DarwinSampler final : public Sampler {
  public:
-  DarwinSampler() {
+  explicit DarwinSampler(int root_sample_ms) : root_sample_ms_(std::clamp(root_sample_ms, 250, 60000)) {
+    snapshot_.macos_version = macos_version_string();
     snapshot_.soc_name = sysctl_string("machdep.cpu.brand_string", "Apple Silicon");
     snapshot_.cpu_core_count = sysctl_scalar<int>("hw.logicalcpu").value_or(0);
     snapshot_.gpu_core_count = gpu_core_count();
@@ -556,6 +577,13 @@ class DarwinSampler final : public Sampler {
   }
 
   SystemSnapshot sample() override {
+    snapshot_.timestamp_unix_ms = unix_time_ms();
+    const auto now = std::chrono::steady_clock::now();
+    if (last_sample_time_.time_since_epoch().count() != 0) {
+      snapshot_.sample_interval_ms = static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(now - last_sample_time_).count());
+    }
+    last_sample_time_ = now;
     sample_load();
     sample_memory();
     sample_system_io();
@@ -1013,6 +1041,7 @@ class DarwinSampler final : public Sampler {
     RootMetrics metrics;
     metrics.sampled = true;
     metrics.sample_time = std::chrono::steady_clock::now();
+    const auto command_timeout = std::chrono::milliseconds(root_sample_ms_ + 2500);
     char plist_template[] = "/tmp/mtop-powermetrics-XXXXXX";
     int fd = mkstemp(plist_template);
     if (fd >= 0) {
@@ -1021,10 +1050,10 @@ class DarwinSampler final : public Sampler {
           "/usr/bin/powermetrics",
           "--samplers", "cpu_power,gpu_power,thermal,ane_power",
           "-n", "1",
-          "-i", "1000",
+          "-i", std::to_string(root_sample_ms_),
           "-f", "plist",
           "-o", plist_template,
-      }, std::chrono::milliseconds(3500));
+      }, command_timeout);
       if (!plist_result.ok) {
         metrics.failure_reason = plist_result.reason.empty() ? "powermetrics plist failed" : plist_result.reason;
       }
@@ -1135,8 +1164,8 @@ class DarwinSampler final : public Sampler {
         "--show-process-energy",
         "--show-process-ipc",
         "-n", "1",
-        "-i", "1000",
-    }, true, std::chrono::milliseconds(3500));
+        "-i", std::to_string(root_sample_ms_),
+    }, true, command_timeout);
     if (!amp_result.ok && metrics.failure_reason.empty()) {
       metrics.failure_reason = amp_result.reason.empty() ? "powermetrics task sampler failed" : amp_result.reason;
     }
@@ -1148,8 +1177,8 @@ class DarwinSampler final : public Sampler {
           "--show-process-amp",
           "--show-process-energy",
           "-n", "1",
-          "-i", "1000",
-      }, true, std::chrono::milliseconds(3500));
+          "-i", std::to_string(root_sample_ms_),
+      }, true, command_timeout);
       AmpData fallback = parse_amp_data(fallback_result.output, has_super);
       if (amp.core_mix.empty()) amp.core_mix = std::move(fallback.core_mix);
       if (amp.power.empty()) amp.power = std::move(fallback.power);
@@ -1183,13 +1212,16 @@ class DarwinSampler final : public Sampler {
         std::lock_guard<std::mutex> lock(root_metrics_mutex_);
         shared_root_metrics_ = std::move(metrics);
       }
-      for (int i = 0; i < 5 && !stop_root_metrics_.load(); ++i) {
+      const int sleep_steps = std::max(1, root_sample_ms_ / 200);
+      for (int i = 0; i < sleep_steps && !stop_root_metrics_.load(); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
       }
     }
   }
 
   SystemSnapshot snapshot_{};
+  int root_sample_ms_ = 1000;
+  std::chrono::steady_clock::time_point last_sample_time_{};
   processor_info_array_t previous_cpu_info_ = nullptr;
   mach_msg_type_number_t previous_cpu_info_count_ = 0;
   natural_t previous_cpu_count_ = 0;
@@ -1215,8 +1247,8 @@ class DarwinSampler final : public Sampler {
 
 }  // namespace
 
-Sampler* create_darwin_sampler() {
-  return new DarwinSampler();
+Sampler* create_darwin_sampler(int root_sample_ms) {
+  return new DarwinSampler(root_sample_ms);
 }
 
 }  // namespace monitor

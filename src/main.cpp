@@ -2,12 +2,15 @@
 #include <chrono>
 #include <cmath>
 #include <clocale>
+#include <cerrno>
 #include <csignal>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <fstream>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <optional>
@@ -17,6 +20,7 @@
 #include <thread>
 #include <vector>
 #include <cstdarg>
+#include <limits>
 
 #include <curses.h>
 #include <sys/resource.h>
@@ -25,7 +29,13 @@
 #include "monitor/input_logic.hpp"
 #include "monitor/input_parser.hpp"
 #include "monitor/metrics.hpp"
+#include "monitor/model/memory_risk_model.hpp"
+#include "monitor/model/workload_model.hpp"
+#include "monitor/output/snapshot_session.hpp"
+#include "monitor/process_sort.hpp"
 #include "monitor/sampler.hpp"
+#include "monitor/snapshot_json.hpp"
+#include "monitor/ui/view_profile.hpp"
 #include "monitor/ui_support.hpp"
 
 namespace {
@@ -33,6 +43,15 @@ namespace {
 enum class PromptMode { None, Search, Filter, Sort, Signal };
 enum class SetupField { Theme, CachedMemory, Refresh, Done };
 constexpr int kFunctionKeyCount = 10;
+#ifndef MTOP_VERSION
+#define MTOP_VERSION "2.0.0"
+#endif
+
+volatile std::sig_atomic_t g_snapshot_interrupted = 0;
+
+void handle_snapshot_signal(int) {
+  g_snapshot_interrupted = 1;
+}
 
 struct ButtonBounds {
   int x0 = -1;
@@ -42,8 +61,10 @@ struct ButtonBounds {
 
 struct UiState {
   monitor::SortMode sort = monitor::SortMode::Cpu;
+  monitor::ViewProfile view_profile = monitor::ViewProfile::Alpha;
   bool tree_mode = false;
   int table_page = 0;
+  int workload_index = 0;
   std::optional<int> selected_pid;
   PromptMode prompt_mode = PromptMode::None;
   monitor::ViewMode view_mode = monitor::ViewMode::Overview;
@@ -60,6 +81,7 @@ struct UiState {
   bool show_help = false;
   bool show_setup = false;
   bool show_process_detail = false;
+  bool show_workload_detail = false;
   bool show_cached_memory = false;
   SetupField setup_field = SetupField::Theme;
   ButtonBounds footer_buttons[kFunctionKeyCount];
@@ -71,9 +93,18 @@ struct RuntimeOptions {
   bool help = false;
   bool version = false;
   bool debug_input = false;
+  bool snapshot_loop = false;
+  bool session = false;
   std::string config_path;
   std::string debug_log_path;
+  std::string output_path;
+  std::string session_label;
+  std::string snapshot_format;
+  std::optional<monitor::ViewProfile> view_profile;
+  std::optional<std::string> invalid_view_profile;
   std::optional<int> refresh_ms;
+  std::optional<int> snapshot_interval_ms;
+  std::optional<int> count;
   std::optional<std::string> theme;
   std::optional<int> process_limit;
 };
@@ -111,6 +142,12 @@ struct IoHistory {
   std::vector<double> net_tx;
 };
 
+struct AlphaModel {
+  std::vector<monitor::WorkloadSnapshot> workloads;
+  std::vector<monitor::AiProcessRow> process_rows;
+  monitor::MemoryRiskSnapshot risk;
+};
+
 struct ProcessColumn {
   const char* title;
   int width;
@@ -125,10 +162,31 @@ constexpr ProcessColumn kProcessColumns[] = {
     {"CPU%", 5, monitor::SortMode::Cpu, true},
     {"MIX", 12, monitor::SortMode::Pid, false},
     {"MEM%", 10, monitor::SortMode::Mem, true},
-    {"GPU", 3, monitor::SortMode::Pid, false},
-    {"IO", 11, monitor::SortMode::Pid, false},
-    {"PWR", 5, monitor::SortMode::Pid, false},
+    {"GPU", 3, monitor::SortMode::GpuActive, true},
+    {"IO", 11, monitor::SortMode::Io, true},
+    {"PWR", 5, monitor::SortMode::Power, true},
 };
+
+std::optional<int> parse_int_arg(const char* value) {
+  if (!value) {
+    return std::nullopt;
+  }
+  errno = 0;
+  char* end = nullptr;
+  const long parsed = std::strtol(value, &end, 10);
+  if (end == value || errno == ERANGE ||
+      parsed < std::numeric_limits<int>::min() ||
+      parsed > std::numeric_limits<int>::max()) {
+    return std::nullopt;
+  }
+  while (end && *end != '\0') {
+    if (!std::isspace(static_cast<unsigned char>(*end))) {
+      return std::nullopt;
+    }
+    ++end;
+  }
+  return static_cast<int>(parsed);
+}
 
 RuntimeOptions parse_args(int argc, char** argv) {
   RuntimeOptions options;
@@ -142,14 +200,40 @@ RuntimeOptions parse_args(int argc, char** argv) {
       options.version = true;
     } else if (arg == "--debug-input") {
       options.debug_input = true;
+    } else if (arg == "--loop") {
+      options.snapshot_loop = true;
+    } else if (arg == "--session") {
+      options.session = true;
     } else if (arg == "--debug-log" && i + 1 < argc) {
       options.debug_log_path = argv[++i];
+    } else if (arg == "--output" && i + 1 < argc) {
+      options.output_path = argv[++i];
+    } else if (arg == "--label" && i + 1 < argc) {
+      options.session_label = argv[++i];
     } else if (arg == "--config" && i + 1 < argc) {
       options.config_path = argv[++i];
+    } else if (arg == "-view" || arg == "--view") {
+      if (i + 1 >= argc) {
+        options.invalid_view_profile = "";
+      } else {
+        const std::string value = argv[++i];
+        if (const auto profile = monitor::parse_view_profile(value)) {
+          options.view_profile = *profile;
+          options.invalid_view_profile.reset();
+        } else {
+          options.invalid_view_profile = value;
+        }
+      }
+    } else if (arg == "--snapshot" && i + 1 < argc) {
+      options.snapshot_format = argv[++i];
     } else if (arg == "--refresh-ms" && i + 1 < argc) {
-      options.refresh_ms = std::atoi(argv[++i]);
+      options.refresh_ms = parse_int_arg(argv[++i]);
+    } else if (arg == "--interval-ms" && i + 1 < argc) {
+      options.snapshot_interval_ms = parse_int_arg(argv[++i]);
+    } else if (arg == "--count" && i + 1 < argc) {
+      options.count = parse_int_arg(argv[++i]);
     } else if (arg == "--process-limit" && i + 1 < argc) {
-      options.process_limit = std::atoi(argv[++i]);
+      options.process_limit = parse_int_arg(argv[++i]);
     } else if (arg == "--theme" && i + 1 < argc) {
       options.theme = std::string(argv[++i]);
     }
@@ -520,13 +604,22 @@ void print_help() {
   std::printf(
       "mtop - Apple Silicon terminal monitor\n\n"
       "Usage:\n"
-      "  mtop [--demo] [--theme THEME] [--refresh-ms MS] [--process-limit N] [--config PATH] [--debug-input] [--debug-log PATH]\n\n"
+      "  mtop [--demo] [-view alpha|beta] [--theme THEME] [--refresh-ms MS] [--process-limit N] [--config PATH] [--debug-input] [--debug-log PATH]\n"
+      "  mtop --snapshot json [--loop] [--count N] [--interval-ms MS] [--session] [--output PATH] [--label TEXT] [--demo] [--config PATH]\n\n"
       "Options:\n"
       "  --demo              Run with synthetic data for UI preview\n"
+      "  --snapshot json     Emit one machine-readable JSON snapshot without curses\n"
+      "  --loop              Keep emitting snapshots until interrupted\n"
+      "  --count N           Emit N snapshots in snapshot loop mode\n"
+      "  --session           Emit JSONL session_start/snapshot/session_end events\n"
+      "  --output PATH       Write snapshot/session output to a file\n"
+      "  --label TEXT        Label a snapshot session\n"
+      "  --interval-ms MS    Snapshot loop interval in milliseconds\n"
       "  --theme THEME       Theme name: apple, green, mono\n"
       "  --refresh-ms MS     Refresh interval in milliseconds\n"
       "  --process-limit N   Number of visible process rows\n"
       "  --config PATH       Explicit config file path\n"
+      "  -view, --view NAME   Select and persist view profile: alpha or beta\n"
       "  --debug-input       Log key and mouse events to file\n"
       "  --debug-log PATH    Override input debug log path\n"
       "  --help, -h          Show this help\n"
@@ -537,7 +630,7 @@ void print_help() {
 }
 
 void print_version() {
-  std::printf("mtop 1.4.0\n");
+  std::printf("mtop %s\n", MTOP_VERSION);
 }
 
 std::string sort_mode_name(monitor::SortMode mode) {
@@ -547,8 +640,89 @@ std::string sort_mode_name(monitor::SortMode mode) {
     case monitor::SortMode::Mem: return "mem";
     case monitor::SortMode::Time: return "time";
     case monitor::SortMode::Name: return "name";
+    case monitor::SortMode::GpuActive: return "gpu";
+    case monitor::SortMode::Io: return "io";
+    case monitor::SortMode::Power: return "power";
   }
   return "cpu";
+}
+
+std::string workload_sort_name() {
+  return "rss";
+}
+
+std::uint64_t unix_time_ms() {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+}
+
+void prepare_snapshot_metadata(monitor::SystemSnapshot& snapshot, int interval_ms) {
+  snapshot.timestamp_unix_ms = unix_time_ms();
+  snapshot.sample_interval_ms = static_cast<std::uint64_t>(std::max(0, interval_ms));
+}
+
+int run_snapshot_mode(monitor::Sampler& sampler, const RuntimeOptions& options, const monitor::AppConfig& config) {
+  if (options.snapshot_format != "json") {
+    std::fprintf(stderr, "unsupported snapshot format: %s\n", options.snapshot_format.c_str());
+    return 2;
+  }
+  std::ofstream output_file;
+  std::ostream* output = &std::cout;
+  if (!options.output_path.empty()) {
+    output_file.open(options.output_path, std::ios::out | std::ios::trunc);
+    if (!output_file) {
+      std::fprintf(stderr, "failed to open output file: %s\n", options.output_path.c_str());
+      return 1;
+    }
+    output = &output_file;
+  }
+  const int interval_ms = std::clamp(options.snapshot_interval_ms.value_or(config.snapshot_interval_ms), 100, 60000);
+  const bool loop_forever = options.snapshot_loop && !options.count.has_value();
+  const int count = options.count.has_value() ? std::max(1, *options.count) : 1;
+  g_snapshot_interrupted = 0;
+  const auto previous_sigint = std::signal(SIGINT, handle_snapshot_signal);
+  const auto previous_sigterm = std::signal(SIGTERM, handle_snapshot_signal);
+  monitor::SnapshotSessionInfo session;
+  if (options.session) {
+    session.started_unix_ms = unix_time_ms();
+    session.session_id = monitor::make_session_id(session.started_unix_ms);
+    session.label = options.session_label;
+    *output << monitor::session_start_json(session) << '\n';
+    output->flush();
+  }
+  int emitted = 0;
+  while (!g_snapshot_interrupted && (loop_forever || emitted < count)) {
+    monitor::SystemSnapshot snapshot = sampler.sample();
+    prepare_snapshot_metadata(snapshot, interval_ms);
+    monitor::SnapshotJsonOptions json_options;
+    json_options.view_profile = config.view_profile;
+    json_options.workloads = monitor::build_workloads(snapshot);
+    json_options.memory_risk = monitor::derive_memory_risk(snapshot, {}, json_options.workloads);
+    const std::string snapshot_json = monitor::snapshot_to_json(snapshot, json_options);
+    if (options.session) {
+      *output << monitor::session_snapshot_json(snapshot_json) << '\n';
+    } else {
+      *output << snapshot_json << '\n';
+    }
+    output->flush();
+    ++emitted;
+    if (g_snapshot_interrupted || (!options.snapshot_loop && !options.count.has_value())) {
+      break;
+    }
+    if (!loop_forever && emitted >= count) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+  }
+  if (options.session) {
+    *output << monitor::session_end_json(session, unix_time_ms()) << '\n';
+    output->flush();
+  }
+  std::signal(SIGINT, previous_sigint);
+  std::signal(SIGTERM, previous_sigterm);
+  return g_snapshot_interrupted ? 130 : 0;
 }
 
 std::string cpu_topology_summary(const monitor::SystemSnapshot& snapshot) {
@@ -685,6 +859,24 @@ void draw_info_bar(const monitor::SystemSnapshot& snapshot, int cols) {
   mvprintw(0, 0, "%s", line.c_str());
 }
 
+void draw_profile_info_bar(const monitor::SystemSnapshot& snapshot,
+                           monitor::ViewProfile profile,
+                           int cols) {
+  move(0, 0);
+  clrtoeol();
+  std::string line = std::string("mtop ") + monitor::view_profile_label(profile) +
+                     " | " + snapshot.soc_name +
+                     " | CPU " + std::to_string(snapshot.cpu_core_count) +
+                     " (" + cpu_topology_summary(snapshot) + ")" +
+                     " | GPU " + std::to_string(snapshot.gpu_core_count) +
+                     " | Therm: " + snapshot.thermal +
+                     " | Uptime: " + format_uptime(snapshot.uptime_seconds);
+  if (static_cast<int>(line.size()) > cols - 1) {
+    line.resize(std::max(0, cols - 1));
+  }
+  mvprintw(0, 0, "%s", line.c_str());
+}
+
 bool process_matches_query(const monitor::ProcessSnapshot& process, const std::string& query) {
   if (query.empty()) {
     return true;
@@ -695,28 +887,38 @@ bool process_matches_query(const monitor::ProcessSnapshot& process, const std::s
          lowercase(process.command).find(needle) != std::string::npos;
 }
 
-bool process_sort_less(const monitor::ProcessSnapshot* lhs,
-                       const monitor::ProcessSnapshot* rhs,
-                       monitor::SortMode mode,
-                       int direction) {
-  switch (mode) {
-    case monitor::SortMode::Pid:
-      if (lhs->pid != rhs->pid) return direction > 0 ? lhs->pid < rhs->pid : lhs->pid > rhs->pid;
-      break;
-    case monitor::SortMode::Cpu:
-      if (lhs->cpu_percent != rhs->cpu_percent) return direction > 0 ? lhs->cpu_percent < rhs->cpu_percent : lhs->cpu_percent > rhs->cpu_percent;
-      break;
-    case monitor::SortMode::Mem:
-      if (lhs->memory_percent != rhs->memory_percent) return direction > 0 ? lhs->memory_percent < rhs->memory_percent : lhs->memory_percent > rhs->memory_percent;
-      break;
-    case monitor::SortMode::Time:
-      if (lhs->total_cpu_time_ns != rhs->total_cpu_time_ns) return direction > 0 ? lhs->total_cpu_time_ns < rhs->total_cpu_time_ns : lhs->total_cpu_time_ns > rhs->total_cpu_time_ns;
-      break;
-    case monitor::SortMode::Name:
-      if (lhs->command != rhs->command) return direction > 0 ? lhs->command < rhs->command : lhs->command > rhs->command;
-      break;
+bool workload_matches_query(const monitor::WorkloadSnapshot& workload, const std::string& query) {
+  if (query.empty()) {
+    return true;
   }
-  return lhs->pid < rhs->pid;
+  const std::string needle = lowercase(query);
+  if (lowercase(workload.name).find(needle) != std::string::npos ||
+      lowercase(monitor::workload_kind_label(workload.kind)).find(needle) != std::string::npos ||
+      lowercase(workload.model_hint).find(needle) != std::string::npos) {
+    return true;
+  }
+  for (const auto& process : workload.processes) {
+    if (lowercase(process.command).find(needle) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool ai_process_matches_query(const monitor::AiProcessRow& row, const std::string& query) {
+  if (!row.process) {
+    return false;
+  }
+  if (process_matches_query(*row.process, query)) {
+    return true;
+  }
+  if (query.empty()) {
+    return true;
+  }
+  const std::string needle = lowercase(query);
+  return lowercase(monitor::workload_kind_label(row.detection.kind)).find(needle) != std::string::npos ||
+         lowercase(row.detection.model_hint).find(needle) != std::string::npos ||
+         lowercase(row.detection.label).find(needle) != std::string::npos;
 }
 
 std::vector<ProcessRow> build_process_rows(const monitor::SystemSnapshot& snapshot, const UiState& state) {
@@ -729,7 +931,7 @@ std::vector<ProcessRow> build_process_rows(const monitor::SystemSnapshot& snapsh
   }
 
   auto less = [&](const monitor::ProcessSnapshot* lhs, const monitor::ProcessSnapshot* rhs) {
-    return process_sort_less(lhs, rhs, state.sort, state.sort_direction);
+    return monitor::process_sort_less(*lhs, *rhs, state.sort, state.sort_direction);
   };
 
   if (!state.tree_mode) {
@@ -805,7 +1007,7 @@ std::vector<ProcessRow> build_gpu_active_rows(const monitor::SystemSnapshot& sna
     }
   }
   auto less = [&](const monitor::ProcessSnapshot* lhs, const monitor::ProcessSnapshot* rhs) {
-    return process_sort_less(lhs, rhs, filtered_state.sort, filtered_state.sort_direction);
+    return monitor::process_sort_less(*lhs, *rhs, filtered_state.sort, filtered_state.sort_direction);
   };
   std::sort(filtered.begin(), filtered.end(), less);
   std::vector<ProcessRow> rows;
@@ -870,6 +1072,26 @@ void apply_search_request(UiState& state, const std::vector<ProcessRow>& rows) {
   set_status(state, "No search match: " + state.search);
 }
 
+void apply_alpha_search_request(UiState& state, const AlphaModel& alpha) {
+  if (!state.search_pending) {
+    return;
+  }
+  state.search_pending = false;
+  if (state.search.empty() || alpha.process_rows.empty()) {
+    return;
+  }
+  const int base_index = std::clamp(state.workload_index, -1, static_cast<int>(alpha.process_rows.size()) - 1);
+  for (int offset = 1; offset <= static_cast<int>(alpha.process_rows.size()); ++offset) {
+    const int index = (base_index + offset + static_cast<int>(alpha.process_rows.size())) %
+                      static_cast<int>(alpha.process_rows.size());
+    if (ai_process_matches_query(alpha.process_rows[index], state.search)) {
+      state.workload_index = index;
+      return;
+    }
+  }
+  set_status(state, "No process search match: " + state.search);
+}
+
 ProcessViewMetrics calculate_process_metrics(const std::vector<ProcessRow>& rows,
                                              UiState& state,
                                              int window_height) {
@@ -929,6 +1151,15 @@ void apply_pid_search(UiState& state, const std::vector<ProcessRow>& rows, int c
     }
   }
   set_status(state, "No PID match: " + state.pid_search, 1200);
+}
+
+void move_workload_selection(UiState& state, const AlphaModel& alpha, int delta) {
+  if (alpha.process_rows.empty()) {
+    state.workload_index = 0;
+    return;
+  }
+  state.workload_index = std::clamp(state.workload_index + delta, 0,
+                                    static_cast<int>(alpha.process_rows.size()) - 1);
 }
 
 void expand_selected(UiState& state) {
@@ -1601,6 +1832,204 @@ void draw_gpu_active_view(WINDOW* window,
   }
 }
 
+std::string workload_display_hint(const monitor::WorkloadSnapshot& workload) {
+  if (!workload.model_hint.empty()) {
+    return workload.model_hint;
+  }
+  if (!workload.processes.empty()) {
+    return workload.processes.front().command;
+  }
+  return "-";
+}
+
+std::string ai_process_model_hint(const monitor::AiProcessRow& row) {
+  if (!row.is_ai) {
+    return "-";
+  }
+  if (!row.detection.model_hint.empty()) {
+    return row.detection.model_hint;
+  }
+  return row.detection.label.empty() ? "-" : row.detection.label;
+}
+
+int ai_process_count(const AlphaModel& alpha) {
+  return static_cast<int>(std::count_if(alpha.process_rows.begin(), alpha.process_rows.end(),
+                                        [](const monitor::AiProcessRow& row) { return row.is_ai; }));
+}
+
+void draw_alpha_workloads_view(WINDOW* window,
+                               const monitor::SystemSnapshot& snapshot,
+                               UiState& state,
+                               const AlphaModel& alpha) {
+  werase(window);
+  wattron(window, COLOR_PAIR(1));
+  box(window, 0, 0);
+  mvwprintw(window, 0, 2, " Alpha Processes ");
+  const std::string risk_title = std::string(" Risk ") + monitor::memory_risk_label(alpha.risk.level) + " ";
+  mvwprintw(window, 0, std::max(2, getmaxx(window) - static_cast<int>(risk_title.size()) - 2), "%s", risk_title.c_str());
+  wattroff(window, COLOR_PAIR(1));
+
+  const int max_y = getmaxy(window);
+  const int max_x = getmaxx(window);
+  const int gpu_active_count = static_cast<int>(std::count_if(
+      snapshot.processes.begin(), snapshot.processes.end(),
+      [](const monitor::ProcessSnapshot& process) { return process.gpu_active; }));
+
+  mvwprintw(window, 1, 2, "%s",
+            elide_right("Headroom " + compact_bytes_with_decimal(alpha.risk.estimated_headroom_bytes) +
+                            " | Swap " + compact_bytes_with_decimal(alpha.risk.swap_used_bytes) +
+                            " | Compr " + compact_bytes_with_decimal(alpha.risk.compressed_bytes) +
+                            " | GPU active " + std::to_string(gpu_active_count) +
+                            " | ANE " + snapshot.ane,
+                        std::max(0, max_x - 4)).c_str());
+  mvwprintw(window, 2, 2, "%s",
+            elide_right(std::string("Risk reason: ") + alpha.risk.reason,
+                        std::max(0, max_x - 4)).c_str());
+  mvwprintw(window, 3, 2, "%s",
+            elide_right("AI processes " + std::to_string(ai_process_count(alpha)) +
+                            " | total processes " + std::to_string(alpha.process_rows.size()),
+                        std::max(0, max_x - 4)).c_str());
+
+  if (max_y < 8) {
+    return;
+  }
+  if (has_colors()) wattron(window, COLOR_PAIR(4));
+  mvwhline(window, 4, 1, ' ', max_x - 2);
+  mvwprintw(window, 4, 2, "AI KIND       PID     CPU%%   RSS      GPU   PWR   MODEL / COMMAND");
+  if (has_colors()) wattroff(window, COLOR_PAIR(4));
+
+  if (alpha.process_rows.empty()) {
+    state.workload_index = 0;
+    mvwprintw(window, 6, 2, "%s",
+              elide_right("No processes visible. Check filter settings or process permissions.",
+                          std::max(0, max_x - 4)).c_str());
+    return;
+  }
+
+  state.workload_index = std::clamp(state.workload_index, 0, static_cast<int>(alpha.process_rows.size()) - 1);
+  const int page_rows = std::max(1, max_y - 6);
+  const int start = std::clamp((state.workload_index / page_rows) * page_rows, 0,
+                               std::max(0, static_cast<int>(alpha.process_rows.size()) - 1));
+  const int end = std::min(start + page_rows, static_cast<int>(alpha.process_rows.size()));
+  for (int index = start; index < end; ++index) {
+    const auto& row_data = alpha.process_rows[index];
+    const auto& process = *row_data.process;
+    const int row = 5 + (index - start);
+    const bool selected = index == state.workload_index;
+    mvwhline(window, row, 1, ' ', max_x - 2);
+    if (selected) {
+      if (has_colors()) wattron(window, COLOR_PAIR(15));
+      else wattron(window, A_REVERSE);
+    }
+    const std::string kind = row_data.is_ai ? monitor::workload_kind_label(row_data.detection.kind) : "-";
+    const std::string hint = row_data.is_ai ? ai_process_model_hint(row_data) : process.command;
+    mvwprintw(window, row, 2, "%-2.2s %-10.10s %5d %5.1f %-8.8s %-5s %-5.5s %s",
+              row_data.is_ai ? "AI" : "-",
+              kind.c_str(),
+              process.pid,
+              process.cpu_percent,
+              compact_bytes_with_decimal(process.resident_bytes).c_str(),
+              process.gpu_active ? "Y" : "N",
+              process.power.c_str(),
+              elide_right(hint, std::max(0, max_x - 56)).c_str());
+    if (selected) {
+      if (has_colors()) wattroff(window, COLOR_PAIR(15));
+      else wattroff(window, A_REVERSE);
+    }
+  }
+}
+
+void draw_ai_process_detail_popup(const WindowLayout& layout,
+                                  const monitor::AiProcessRow& row,
+                                  const monitor::MemoryRiskSnapshot& risk,
+                                  const monitor::SystemSnapshot& snapshot) {
+  if (!row.process) {
+    return;
+  }
+  const auto& process = *row.process;
+  const int height = 17;
+  const int width = std::min(92, layout.cols - 4);
+  const int y = std::max(1, (layout.rows - height) / 2);
+  const int x = std::max(2, (layout.cols - width) / 2);
+  WINDOW* popup = newwin(height, width, y, x);
+  box(popup, 0, 0);
+  if (has_colors()) wattron(popup, COLOR_PAIR(4));
+  mvwhline(popup, 0, 1, ' ', width - 2);
+  mvwprintw(popup, 0, 2, row.is_ai ? " AI Process Detail " : " Process Detail ");
+  if (has_colors()) wattroff(popup, COLOR_PAIR(4));
+  mvwhline(popup, 1, 1, ACS_HLINE, width - 2);
+  mvwprintw(popup, 3, 3, "Command   : %s", elide_right(process.command, std::max(0, width - 16)).c_str());
+  mvwprintw(popup, 4, 3, "PID/PPID  : %d / %d", process.pid, process.parent_pid);
+  mvwprintw(popup, 5, 3, "Kind      : %s", row.is_ai ? monitor::workload_kind_label(row.detection.kind) : "-");
+  mvwprintw(popup, 6, 3, "Role      : %s", row.is_ai ? monitor::workload_role_name(row.detection.role) : "-");
+  mvwprintw(popup, 7, 3, "%s",
+            elide_right("Reason    : " + (row.is_ai ? row.detection.reason : std::string("not detected as AI workload")),
+                        std::max(0, width - 6)).c_str());
+  mvwprintw(popup, 8, 3, "%s",
+            elide_right("Memory    : RSS " + compact_bytes_with_decimal(process.resident_bytes) +
+                            ", system headroom " + compact_bytes_with_decimal(risk.estimated_headroom_bytes),
+                        std::max(0, width - 6)).c_str());
+  mvwprintw(popup, 9, 3, "GPU       : %s", process.gpu_active ? "active" : "n/a");
+  mvwprintw(popup, 10, 3, "%s",
+            elide_right("Risk      : " + std::string(monitor::memory_risk_label(risk.level)) +
+                            " - " + risk.reason,
+                        std::max(0, width - 6)).c_str());
+  mvwprintw(popup, 11, 3, "%s",
+            elide_right("Root data : " + monitor::metric_status_label(snapshot.capabilities.root_process_status),
+                        std::max(0, width - 6)).c_str());
+  mvwprintw(popup, 12, 3, "%s",
+            elide_right("Signals   : MIX " + process.core_mix + "  IO " + process.io + "  PWR " + process.power,
+                        std::max(0, width - 6)).c_str());
+  mvwhline(popup, height - 2, 1, ACS_HLINE, width - 2);
+  mvwprintw(popup, height - 1, 3, "Enter / Esc / d to close");
+  wnoutrefresh(popup);
+  delwin(popup);
+}
+
+void draw_workload_detail_popup(const WindowLayout& layout,
+                                const monitor::WorkloadSnapshot& workload,
+                                const monitor::MemoryRiskSnapshot& risk,
+                                const monitor::SystemSnapshot& snapshot) {
+  const int height = 17;
+  const int width = std::min(92, layout.cols - 4);
+  const int y = std::max(1, (layout.rows - height) / 2);
+  const int x = std::max(2, (layout.cols - width) / 2);
+  WINDOW* popup = newwin(height, width, y, x);
+  box(popup, 0, 0);
+  if (has_colors()) wattron(popup, COLOR_PAIR(4));
+  mvwhline(popup, 0, 1, ' ', width - 2);
+  mvwprintw(popup, 0, 2, " Workload Detail ");
+  if (has_colors()) wattroff(popup, COLOR_PAIR(4));
+  mvwhline(popup, 1, 1, ACS_HLINE, width - 2);
+  mvwprintw(popup, 3, 3, "Name      : %s", elide_right(workload.name + " / " + workload_display_hint(workload), std::max(0, width - 16)).c_str());
+  mvwprintw(popup, 4, 3, "Kind      : %s", monitor::workload_kind_label(workload.kind));
+  mvwprintw(popup, 5, 3, "Risk      : %s", monitor::memory_risk_label(risk.level));
+  mvwprintw(popup, 6, 3, "%s", elide_right("Reason    : " + risk.reason, std::max(0, width - 6)).c_str());
+  mvwprintw(popup, 7, 3, "%s",
+            elide_right("Memory    : RSS " + compact_bytes_with_decimal(workload.resident_bytes) +
+                            ", system headroom " + compact_bytes_with_decimal(risk.estimated_headroom_bytes),
+                        std::max(0, width - 6)).c_str());
+  mvwprintw(popup, 8, 3, "GPU       : %s", workload.gpu_active ? "active" : "n/a");
+  mvwprintw(popup, 9, 3, "%s",
+            elide_right("Root data : " + monitor::metric_status_label(snapshot.capabilities.root_process_status),
+                        std::max(0, width - 6)).c_str());
+  mvwprintw(popup, 11, 3, "Processes :");
+  int row = 11;
+  for (const auto& process : workload.processes) {
+    if (++row >= height - 3) {
+      break;
+    }
+    mvwprintw(popup, row, 14, "%5d %-8.8s %s",
+              process.pid,
+              monitor::workload_role_name(process.role),
+              elide_right(process.command, std::max(0, width - 29)).c_str());
+  }
+  mvwhline(popup, height - 2, 1, ACS_HLINE, width - 2);
+  mvwprintw(popup, height - 1, 3, "Enter / Esc / d to close");
+  wnoutrefresh(popup);
+  delwin(popup);
+}
+
 void draw_process_detail_popup(const WindowLayout& layout,
                                const monitor::ProcessSnapshot& process,
                                const monitor::SystemSnapshot& snapshot) {
@@ -1676,7 +2105,7 @@ void draw_footer(WINDOW* window, UiState& state) {
     mvwprintw(window, 0, 0, "%s", elide_right("filter> " + state.prompt_buffer, std::max(0, width - 1)).c_str());
   } else if (state.prompt_mode == PromptMode::Sort) {
     mvwprintw(window, 0, 0, "%s",
-              elide_right("sort> [N]PID [P]CPU [M]EM [T]IME [A]NAME [I]nvert", std::max(0, width - 1)).c_str());
+              elide_right("sort> [N]PID [P]CPU [M]EM [T]IME [A]NAME [G]PU [O]IO [W]PWR [I]nvert", std::max(0, width - 1)).c_str());
   } else if (state.prompt_mode == PromptMode::Signal) {
     mvwprintw(window, 0, 0, "%s", elide_right("signal> " + state.prompt_buffer, std::max(0, width - 1)).c_str());
   } else if (!state.status_message.empty() &&
@@ -1684,11 +2113,15 @@ void draw_footer(WINDOW* window, UiState& state) {
     mvwprintw(window, 0, 0, "%s", elide_right(state.status_message, std::max(0, width - 1)).c_str());
   } else {
     const bool compact = width < 72;
+    const std::string profile = std::string("profile=") + monitor::view_profile_name(state.view_profile);
+    const std::string view = state.view_profile == monitor::ViewProfile::Alpha
+                                 ? "AI Workloads"
+                                 : monitor::view_mode_label(state.view_mode);
     const std::string line = compact
-                                 ? std::string("view=") + monitor::view_mode_label(state.view_mode) +
-                                       " | sort=" + sort_mode_name(state.sort)
-                                 : std::string("view=") + monitor::view_mode_label(state.view_mode) +
-                                       " | sort=" + sort_mode_name(state.sort) +
+                                 ? profile + " | view=" + view +
+                                       " | sort=" + (state.view_profile == monitor::ViewProfile::Alpha ? workload_sort_name() : sort_mode_name(state.sort))
+                                 : profile + " | view=" + view +
+                                       " | sort=" + (state.view_profile == monitor::ViewProfile::Alpha ? workload_sort_name() : sort_mode_name(state.sort)) +
                                        (state.sort_direction > 0 ? " asc" : " desc") +
                                        " | tree=" + (state.tree_mode ? "on" : "off") +
                                        " | filter=" + (state.filter.empty() ? "-" : state.filter) +
@@ -1727,10 +2160,11 @@ void draw_help_popup(const WindowLayout& layout) {
   mvwprintw(popup, 6, 3, "F5 or t: tree view");
   mvwprintw(popup, 7, 3, "F6 or > or .: sort menu");
   mvwprintw(popup, 8, 3, "N/P/M/T/A/I: PID, CPU, MEM, TIME, NAME, invert");
-  mvwprintw(popup, 9, 3, "F7/F8 or {/}: switch view  Tab/Shift-Tab also works");
-  mvwprintw(popup, 10, 3, "Views: Overview / System I/O / GPU Active");
-  mvwprintw(popup, 11, 3, "[/]: renice  F9 or k: send signal  d: process detail");
-  mvwprintw(popup, 12, 3, "Mouse: click headers to sort, click rows to select");
+  mvwprintw(popup, 9, 3, "G/O/W: GPU-active, IO, power sort");
+  mvwprintw(popup, 10, 3, "F7/F8 or {/}: switch view  Tab/Shift-Tab also works");
+  mvwprintw(popup, 11, 3, "Views: Overview / System I/O / GPU Active");
+  mvwprintw(popup, 12, 3, "[/]: renice  F9 or k: send signal  d: process detail");
+  mvwprintw(popup, 13, 3, "Mouse: click headers to sort, click rows to select");
   mvwhline(popup, height - 2, 1, ACS_HLINE, width - 2);
   mvwprintw(popup, height - 1, 3, "Esc / Enter / F1 to close");
   wnoutrefresh(popup);
@@ -1879,15 +2313,21 @@ int synthesize_mouse_event(const WindowLayout& layout,
 bool handle_input(int ch,
                   monitor::AppConfig& config,
                   UiState& state,
+                  const AlphaModel& alpha,
                   const std::vector<ProcessRow>& rows,
                   const ProcessViewMetrics& metrics) {
   auto cycle_view = [&](int delta) {
+    if (state.view_profile == monitor::ViewProfile::Alpha) {
+      set_status(state, "Alpha profile: AI Workloads");
+      return true;
+    }
     set_view_mode(state, monitor::cycle_view_mode(state.view_mode, delta));
     set_status(state, std::string("View: ") + monitor::view_mode_label(state.view_mode));
     return true;
   };
-  const bool process_view_active = state.view_mode == monitor::ViewMode::Overview ||
-                                   state.view_mode == monitor::ViewMode::GpuActive;
+  const bool process_view_active = state.view_profile == monitor::ViewProfile::Beta &&
+                                   (state.view_mode == monitor::ViewMode::Overview ||
+                                    state.view_mode == monitor::ViewMode::GpuActive);
 
   if (state.show_help) {
     if (ch == 27 || ch == '\n' || ch == KEY_ENTER || ch == KEY_F(1)) {
@@ -1899,6 +2339,13 @@ bool handle_input(int ch,
   if (state.show_process_detail) {
     if (ch == 27 || ch == '\n' || ch == KEY_ENTER || ch == 'd' || ch == 'D') {
       state.show_process_detail = false;
+    }
+    return true;
+  }
+
+  if (state.show_workload_detail) {
+    if (ch == 27 || ch == '\n' || ch == KEY_ENTER || ch == 'd' || ch == 'D') {
+      state.show_workload_detail = false;
     }
     return true;
   }
@@ -2000,6 +2447,15 @@ bool handle_input(int ch,
         case 'a':
           set_sort_mode(state, monitor::SortMode::Name);
           break;
+        case 'g':
+          set_sort_mode(state, monitor::SortMode::GpuActive);
+          break;
+        case 'o':
+          set_sort_mode(state, monitor::SortMode::Io);
+          break;
+        case 'w':
+          set_sort_mode(state, monitor::SortMode::Power);
+          break;
         case 'i':
           state.sort_direction *= -1;
           break;
@@ -2024,15 +2480,27 @@ bool handle_input(int ch,
     case KEY_F(10):
       return false;
     case KEY_UP:
+      if (state.view_profile == monitor::ViewProfile::Alpha) {
+        move_workload_selection(state, alpha, -1);
+        return true;
+      }
       if (!process_view_active) return true;
       move_selection(state, rows, -1);
       return true;
     case KEY_DOWN:
+      if (state.view_profile == monitor::ViewProfile::Alpha) {
+        move_workload_selection(state, alpha, 1);
+        return true;
+      }
       if (!process_view_active) return true;
       move_selection(state, rows, 1);
       return true;
     case KEY_PPAGE:
     case KEY_LEFT:
+      if (state.view_profile == monitor::ViewProfile::Alpha) {
+        move_workload_selection(state, alpha, -5);
+        return true;
+      }
       if (!process_view_active) {
         return cycle_view(-1);
       }
@@ -2040,16 +2508,28 @@ bool handle_input(int ch,
       return true;
     case KEY_NPAGE:
     case KEY_RIGHT:
+      if (state.view_profile == monitor::ViewProfile::Alpha) {
+        move_workload_selection(state, alpha, 5);
+        return true;
+      }
       if (!process_view_active) {
         return cycle_view(1);
       }
       move_selection(state, rows, metrics.page_rows);
       return true;
     case KEY_HOME:
+      if (state.view_profile == monitor::ViewProfile::Alpha) {
+        state.workload_index = 0;
+        return true;
+      }
       if (!process_view_active) return true;
       if (!rows.empty()) state.selected_pid = rows.front().process->pid;
       return true;
     case KEY_END:
+      if (state.view_profile == monitor::ViewProfile::Alpha) {
+        if (!alpha.process_rows.empty()) state.workload_index = static_cast<int>(alpha.process_rows.size()) - 1;
+        return true;
+      }
       if (!process_view_active) return true;
       if (!rows.empty()) state.selected_pid = rows.back().process->pid;
       return true;
@@ -2073,6 +2553,18 @@ bool handle_input(int ch,
     case 'A':
       set_sort_mode(state, monitor::SortMode::Name);
       return true;
+    case 'g':
+    case 'G':
+      set_sort_mode(state, monitor::SortMode::GpuActive);
+      return true;
+    case 'o':
+    case 'O':
+      set_sort_mode(state, monitor::SortMode::Io);
+      return true;
+    case 'w':
+    case 'W':
+      set_sort_mode(state, monitor::SortMode::Power);
+      return true;
     case 'i':
     case 'I':
       state.sort_direction *= -1;
@@ -2084,6 +2576,11 @@ bool handle_input(int ch,
       return cycle_view(-1);
     case 's':
     case 'S':
+      if (state.view_profile == monitor::ViewProfile::Alpha) {
+        state.sort_direction *= -1;
+        set_status(state, std::string("Sort: rss ") + (state.sort_direction > 0 ? "asc" : "desc"));
+        return true;
+      }
       set_sort_mode(state, monitor::cycle_sort(state.sort));
       set_status(state, "Sort: " + sort_mode_name(state.sort) + (state.sort_direction > 0 ? " asc" : " desc"));
       return true;
@@ -2138,6 +2635,14 @@ bool handle_input(int ch,
       return true;
     case 'd':
     case 'D':
+      if (state.view_profile == monitor::ViewProfile::Alpha) {
+        if (!alpha.process_rows.empty()) {
+          state.show_workload_detail = true;
+        } else {
+          set_status(state, "No selected process");
+        }
+        return true;
+      }
       if (state.selected_pid.has_value()) {
         state.show_process_detail = true;
       } else {
@@ -2233,11 +2738,32 @@ int main(int argc, char** argv) {
   }
 
   monitor::AppConfig config = monitor::load_config(options.config_path);
+  if (options.invalid_view_profile.has_value()) {
+    if (options.invalid_view_profile->empty()) {
+      std::fprintf(stderr, "missing view profile after -view/--view (expected alpha or beta)\n");
+    } else {
+      std::fprintf(stderr,
+                   "invalid view profile: %s (expected alpha or beta)\n",
+                   options.invalid_view_profile->c_str());
+    }
+    return 2;
+  }
+  if (options.view_profile.has_value()) {
+    std::string error;
+    if (!monitor::persist_view_profile(options.config_path, *options.view_profile, &error)) {
+      std::fprintf(stderr, "failed to persist view profile: %s\n", error.c_str());
+      return 1;
+    }
+    config.view_profile = *options.view_profile;
+  }
   if (options.refresh_ms.has_value()) {
-    config.refresh_ms = *options.refresh_ms;
+    config.refresh_ms = std::clamp(*options.refresh_ms, 100, 60000);
+  }
+  if (options.snapshot_interval_ms.has_value()) {
+    config.snapshot_interval_ms = std::clamp(*options.snapshot_interval_ms, 100, 60000);
   }
   if (options.process_limit.has_value()) {
-    config.process_limit = std::max(4, *options.process_limit);
+    config.process_limit = std::clamp(*options.process_limit, 4, 1000);
   }
   if (options.theme.has_value()) {
     config.theme = *options.theme;
@@ -2247,10 +2773,14 @@ int main(int argc, char** argv) {
   }
 
   std::unique_ptr<monitor::Sampler> sampler(
-      config.demo_mode ? monitor::create_demo_sampler() : monitor::create_darwin_sampler());
+      config.demo_mode ? monitor::create_demo_sampler() : monitor::create_darwin_sampler(config.root_sample_ms));
   if (!sampler) {
     std::fprintf(stderr, "failed to create sampler\n");
     return 1;
+  }
+
+  if (!options.snapshot_format.empty()) {
+    return run_snapshot_mode(*sampler, options, config);
   }
 
   if (options.debug_input) {
@@ -2282,8 +2812,14 @@ int main(int argc, char** argv) {
   log_input_capabilities(active_mask);
 
   UiState state;
+  state.view_profile = config.view_profile;
+  state.show_cached_memory = config.show_cached_memory;
+  state.view_mode = config.default_view;
+  state.sort = config.sort;
+  state.sort_direction = config.sort_direction;
   std::vector<double> gpu_history;
   std::vector<double> power_history;
+  std::vector<monitor::SystemSnapshot> snapshot_history;
   IoHistory io_history;
   int rows = 0;
   int cols = 0;
@@ -2294,6 +2830,7 @@ int main(int argc, char** argv) {
 
   while (running) {
     monitor::SystemSnapshot snapshot = sampler->sample();
+    std::vector<monitor::SystemSnapshot> prior_history = snapshot_history;
 
     gpu_history.push_back(snapshot.gpu_utilization_percent);
     power_history.push_back(snapshot.system_power_watts);
@@ -2305,6 +2842,10 @@ int main(int argc, char** argv) {
     if (power_history.size() > static_cast<std::size_t>(max_history)) {
       power_history.erase(power_history.begin(), power_history.begin() + (power_history.size() - max_history));
     }
+    snapshot_history.push_back(snapshot);
+    if (snapshot_history.size() > 8) {
+      snapshot_history.erase(snapshot_history.begin(), snapshot_history.begin() + (snapshot_history.size() - 8));
+    }
 
     getmaxyx(stdscr, rows, cols);
     if (rows != layout.rows || cols != layout.cols) {
@@ -2313,7 +2854,37 @@ int main(int argc, char** argv) {
       layout = create_windows(rows, cols);
     }
 
-    const bool gpu_active_view = state.view_mode == monitor::ViewMode::GpuActive;
+    const bool beta_profile = state.view_profile == monitor::ViewProfile::Beta;
+    AlphaModel alpha_model;
+    if (!beta_profile) {
+      alpha_model.workloads = monitor::build_workloads(snapshot);
+      alpha_model.process_rows = monitor::build_ai_process_rows(snapshot);
+      if (!state.filter.empty()) {
+        alpha_model.workloads.erase(
+            std::remove_if(alpha_model.workloads.begin(), alpha_model.workloads.end(),
+                           [&](const auto& workload) { return !workload_matches_query(workload, state.filter); }),
+            alpha_model.workloads.end());
+        alpha_model.process_rows.erase(
+            std::remove_if(alpha_model.process_rows.begin(), alpha_model.process_rows.end(),
+                           [&](const auto& row) { return !ai_process_matches_query(row, state.filter); }),
+            alpha_model.process_rows.end());
+      }
+      if (state.sort_direction > 0) {
+        std::sort(alpha_model.workloads.begin(), alpha_model.workloads.end(),
+                  [](const auto& lhs, const auto& rhs) { return lhs.resident_bytes < rhs.resident_bytes; });
+        std::sort(alpha_model.process_rows.begin(), alpha_model.process_rows.end(),
+                  [](const auto& lhs, const auto& rhs) {
+                    if (lhs.is_ai != rhs.is_ai) return lhs.is_ai && !rhs.is_ai;
+                    if (lhs.process->resident_bytes != rhs.process->resident_bytes) {
+                      return lhs.process->resident_bytes < rhs.process->resident_bytes;
+                    }
+                    return lhs.process->pid < rhs.process->pid;
+                  });
+      }
+      alpha_model.risk = monitor::derive_memory_risk(snapshot, prior_history, alpha_model.workloads);
+      apply_alpha_search_request(state, alpha_model);
+    }
+    const bool gpu_active_view = beta_profile && state.view_mode == monitor::ViewMode::GpuActive;
     std::vector<ProcessRow> process_rows = gpu_active_view
                                                ? build_gpu_active_rows(snapshot, state)
                                                : build_process_rows(snapshot, state);
@@ -2322,11 +2893,17 @@ int main(int argc, char** argv) {
         calculate_process_metrics(process_rows, state, getmaxy(layout.processes));
 
     erase();
-    draw_info_bar(snapshot, cols);
+    if (beta_profile) {
+      draw_info_bar(snapshot, cols);
+    } else {
+      draw_profile_info_bar(snapshot, state.view_profile, cols);
+    }
     draw_cpu(layout.cpu, snapshot);
     draw_gpu(layout.gpu, snapshot, gpu_history, power_history, config.refresh_ms);
     draw_memory(layout.memory, snapshot, state);
-    if (state.view_mode == monitor::ViewMode::SystemIo) {
+    if (!beta_profile) {
+      draw_alpha_workloads_view(layout.processes, snapshot, state, alpha_model);
+    } else if (state.view_mode == monitor::ViewMode::SystemIo) {
       draw_system_io_view(layout.processes, snapshot, io_history, config.refresh_ms);
     } else if (state.view_mode == monitor::ViewMode::GpuActive) {
       draw_gpu_active_view(layout.processes, process_rows, state, process_metrics);
@@ -2338,6 +2915,13 @@ int main(int argc, char** argv) {
       draw_help_popup(layout);
     } else if (state.show_setup) {
       draw_setup_popup(layout, state, config);
+    } else if (state.show_workload_detail) {
+      if (!alpha_model.process_rows.empty()) {
+        state.workload_index = std::clamp(state.workload_index, 0, static_cast<int>(alpha_model.process_rows.size()) - 1);
+        draw_ai_process_detail_popup(layout, alpha_model.process_rows[state.workload_index], alpha_model.risk, snapshot);
+      } else {
+        state.show_workload_detail = false;
+      }
     } else if (state.show_process_detail) {
       if (const auto* process = selected_process(process_rows, state)) {
         draw_process_detail_popup(layout, *process, snapshot);
@@ -2385,7 +2969,7 @@ int main(int argc, char** argv) {
           ch = ERR;
         }
       }
-      if (ch != ERR && !handle_input(ch, config, state, process_rows, process_metrics)) {
+      if (ch != ERR && !handle_input(ch, config, state, alpha_model, process_rows, process_metrics)) {
         running = false;
         break;
       }

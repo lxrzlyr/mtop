@@ -114,6 +114,9 @@ struct CapabilitySnapshot {
 };
 
 struct SystemSnapshot {
+  std::uint64_t timestamp_unix_ms = 0;
+  std::uint64_t sample_interval_ms = 0;
+  std::string macos_version = "macOS";
   std::string soc_name = "Apple Silicon";
   int cpu_core_count = 0;
   int gpu_core_count = 0;

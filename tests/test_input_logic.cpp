@@ -11,6 +11,9 @@ int main() {
   assert(monitor::default_sort_direction(SortMode::Cpu) == -1);
   assert(monitor::default_sort_direction(SortMode::Mem) == -1);
   assert(monitor::default_sort_direction(SortMode::Time) == -1);
+  assert(monitor::default_sort_direction(SortMode::GpuActive) == -1);
+  assert(monitor::default_sort_direction(SortMode::Io) == -1);
+  assert(monitor::default_sort_direction(SortMode::Power) == -1);
 
   SortState state{SortMode::Cpu, -1};
   state = monitor::apply_header_sort_click(state, SortMode::Mem);
@@ -32,6 +35,9 @@ int main() {
   assert(monitor::cycle_sort(SortMode::Cpu) == SortMode::Mem);
   assert(monitor::cycle_sort(SortMode::Mem) == SortMode::Time);
   assert(monitor::cycle_sort(SortMode::Time) == SortMode::Name);
-  assert(monitor::cycle_sort(SortMode::Name) == SortMode::Pid);
+  assert(monitor::cycle_sort(SortMode::Name) == SortMode::GpuActive);
+  assert(monitor::cycle_sort(SortMode::GpuActive) == SortMode::Io);
+  assert(monitor::cycle_sort(SortMode::Io) == SortMode::Power);
+  assert(monitor::cycle_sort(SortMode::Power) == SortMode::Pid);
   return 0;
 }

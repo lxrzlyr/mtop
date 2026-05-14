@@ -10,7 +10,7 @@ class Sampler {
   virtual SystemSnapshot sample() = 0;
 };
 
-Sampler* create_darwin_sampler();
+Sampler* create_darwin_sampler(int root_sample_ms = 1000);
 Sampler* create_demo_sampler();
 
 }  // namespace monitor

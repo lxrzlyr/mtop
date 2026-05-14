@@ -8,7 +8,10 @@ SortMode cycle_sort(SortMode mode) {
     case SortMode::Cpu: return SortMode::Mem;
     case SortMode::Mem: return SortMode::Time;
     case SortMode::Time: return SortMode::Name;
-    case SortMode::Name: return SortMode::Pid;
+    case SortMode::Name: return SortMode::GpuActive;
+    case SortMode::GpuActive: return SortMode::Io;
+    case SortMode::Io: return SortMode::Power;
+    case SortMode::Power: return SortMode::Pid;
   }
   return SortMode::Cpu;
 }
@@ -20,6 +23,9 @@ int default_sort_direction(SortMode mode) {
     case SortMode::Cpu:
     case SortMode::Mem:
     case SortMode::Time:
+    case SortMode::GpuActive:
+    case SortMode::Io:
+    case SortMode::Power:
       return -1;
   }
   return -1;
